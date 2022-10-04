@@ -1,0 +1,10 @@
+{
+  "log_path": ".",
+  "es": {
+    "host": "http://localhost",
+    "port": 9200,
+    "index_name": "logfowd",
+    "flush_interval": 10,
+    "workers": 1
+  }
+}
