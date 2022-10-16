@@ -1,5 +1,5 @@
 [package]
-name = "logfowd"
+name = "logfowd2"
 version = "0.1.0"
 edition = "2021"
 publish = false
@@ -22,7 +22,10 @@ time = "^0.3"
 libc = "^0.2"
 url = "^2.2"
 async-trait = "^0.1"
-notify = "5.0.0"
+notify = "^5.0"
+reqwest = "^0.11"
+chrono = { version = "^0.4", features = ["serde"] }
+regex = "1.6.0"
 
 [dependencies.uuid]
 version = "^1.1"

@@ -1,0 +1,8 @@
+/vendor
+/.git*
+/.idea
+
+/conf/config.json
+/conf/config.local.json
+
+helm

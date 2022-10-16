@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "logfowd2.fullname" . }}-config
+  labels:
+    {{- include "logfowd2.labels" . | nindent 4 }}
+data:
+  config.json: |
+    {
+      "log_path": "{{ .Values.app.logs_path }}",
+      "debug_mode": {{ .Values.app.debug_mode }},
+      "es": {
+        "host": "{{ .Values.app.elasticsearch.host }}",
+        "port": {{ .Values.app.elasticsearch.port }},
+        "index_name": "{{ .Values.app.elasticsearch.index_name }}",
+        "flush_interval": {{ .Values.app.elasticsearch.flush_interval }},
+        "workers": {{ .Values.app.elasticsearch.workers }}
+      }
+    }

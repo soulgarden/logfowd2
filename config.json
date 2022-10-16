@@ -1,7 +1,8 @@
 {
-  "log_path": ".",
+  "log_path": "/var/log/pods",
+  "is_debug": true,
   "es": {
-    "host": "http://localhost",
+    "host": "http://127.0.0.1",
     "port": 9200,
     "index_name": "logfowd",
     "flush_interval": 10,

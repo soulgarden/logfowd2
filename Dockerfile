@@ -1,6 +1,6 @@
 FROM rust:1.63-alpine3.16 as builder
 
-RUN apk add --no-cache musl-dev
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev
 
 COPY . /tmp/rust/src/github.com/soulgarden/logfowd2
 

@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "logfowd2.fullname" . }}
+  labels:
+    {{- include "logfowd2.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "logfowd2.fullname" . }}
+  replicas: {{ int .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "logfowd2.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "logfowd2.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "logfowd2.serviceAccountName" . }}
+      securityContext:
+       {{- toYaml .Values.securityContext | nindent 12 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            privileged: false
+            readOnlyRootFilesystem: false
+          volumeMounts:
+            - { name: varlog, mountPath: /var/log, readOnly: true }
+            - { name: config, subPath: config.json, mountPath: /config.json, readOnly: true }
+      volumes:
+        - { name: varlog, hostPath: { path: "/var/log" } }
+        - { name: config, configMap: { name: {{ include "logfowd2.fullname" . }}-config } }
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  {{- include "logfowd2.selectorLabels" . | nindent 18 }}
+              topologyKey: "kubernetes.io/hostname"
+
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

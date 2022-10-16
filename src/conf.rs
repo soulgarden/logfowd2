@@ -1,12 +1,25 @@
+use std::env::VarError;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
+use std::{env, fmt};
 
 use serde::Deserialize;
-use serde_json::Result;
+
+#[derive(Debug, Clone)]
+pub struct ConfError {
+    pub message: String,
+}
+
+impl fmt::Display for ConfError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        write!(f, "ConfError: {}", self.message)
+    }
+}
 
 #[derive(Deserialize, Clone)]
 pub struct Conf {
+    pub is_debug: bool,
     pub es: ES,
     pub log_path: String,
 }
@@ -21,8 +34,15 @@ pub struct ES {
 }
 
 impl Conf {
-    pub fn new() -> Result<Self> {
-        let file = File::open("config.json").expect("can't open config.json file");
+    pub fn new() -> Result<Conf, ConfError> {
+        let path = match env::var("CFG_PATH") {
+            Ok(path) => path,
+            Err(_) => "./config.json".to_string(),
+        };
+
+        let file = File::open(path).map_err(|e| ConfError {
+            message: format!("can't open config.json file, {}", e.to_string()),
+        })?;
 
         let mut buf_reader = BufReader::new(file);
 
@@ -30,9 +50,13 @@ impl Conf {
 
         buf_reader
             .read_to_string(&mut contents)
-            .expect("can't read config.json file");
+            .map_err(|e| ConfError {
+                message: format!("can't read config.json file, {}", e),
+            })?;
 
-        let conf: Conf = serde_json::from_str(contents.as_str())?;
+        let conf: Conf = serde_json::from_str(contents.as_str()).map_err(|e| ConfError {
+            message: format!("can't parse config.json file, {}", e),
+        })?;
 
         return Ok(conf);
     }

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "logfowd2.fullname" . }}
+  labels:
+    {{- include "logfowd2.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  clusterIP: None
+  selector:
+    {{- include "logfowd2.selectorLabels" . | nindent 4 }}

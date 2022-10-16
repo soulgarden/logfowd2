@@ -1,0 +1,25 @@
+version: "3"
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 160.25.100.0/24
+
+services:
+  elasticsearch-master:
+    container_name: elasticsearch-master
+    image: elasticsearch:7.16.2
+    restart: always
+    environment:
+      cluster.name: elasticsearch
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      ES_JAVA_OPTS: "-Xms32m -Xmx192m"
+    expose:
+      - 9200
+    ports:
+      - "9200:9200"
+    networks:
+      default:
+        ipv4_address: 160.25.100.2
