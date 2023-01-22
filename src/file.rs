@@ -6,7 +6,6 @@ use tokio::io::{AsyncBufReadExt, Lines};
 use crate::events::{Event, Meta};
 
 pub struct File {
-    path: String,
     lines: Lines<BufReader<TokioFile>>,
     meta: Meta,
 }
@@ -19,7 +18,7 @@ impl File {
 
         let lines: Lines<BufReader<TokioFile>> = reader.lines();
 
-        Ok(File { path, lines, meta })
+        Ok(File { lines, meta })
     }
 
     // just skip all lines after file creation

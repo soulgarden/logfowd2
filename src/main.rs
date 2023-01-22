@@ -1,12 +1,13 @@
 // #![deny(warnings)]
 #![forbid(unsafe_code)]
 
+extern crate core;
+
 use std::sync::Arc;
 
 use json_env_logger2::builder;
 use json_env_logger2::env_logger::Target;
-use log::{debug, warn, LevelFilter};
-use tokio::sync::RwLock;
+use log::{warn, LevelFilter};
 
 use crate::conf::Conf;
 use crate::sender::Sender;
@@ -46,18 +47,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let notify = listen_signals();
 
-    let sub_svc_shutdown_notify = notify.clone();
+    let watcher_shutdown_notify = notify.clone();
+    let sender_shutdown_notify = notify.clone();
 
-    let sender = Arc::new(RwLock::new(Sender::new(conf.clone())));
+    let sender = Arc::new(Sender::new(conf.clone()));
 
     let mut watcher = Watcher::new(conf.clone(), sender.clone());
 
     let result = tokio::try_join!(
-        tokio::task::spawn(async move { watcher.run().await }),
-        tokio::task::spawn(async move { sender.read().await.run().await }),
+        tokio::task::spawn(async move {
+            watcher.run(watcher_shutdown_notify).await?;
+            Ok::<(), notify::Error>(())
+        }),
+        tokio::task::spawn(async move {
+            sender.run(sender_shutdown_notify).await?;
+            Ok::<(), String>(())
+        }),
     );
 
     match result {
+        Ok((Err(e1), Err(e2))) => {
+            log::error!("watcher and sender finished with errors: {}, {}", e1, e2)
+        }
+        Ok((Ok(()), Err(e2))) => log::error!("sender finished with error: {}", e2),
+        Ok((Err(e1), Ok(()))) => log::error!("watcher finished with error: {}", e1),
         Ok(_) => log::info!("shutdown completed"),
         Err(e) => log::error!("thread join error {}", e),
     }

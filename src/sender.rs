@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use bytes::BufMut;
 use chrono::Utc;
 use log::warn;
 use reqwest::Client;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::events::Event;
 use crate::requests::{FieldsBody, Index};
@@ -20,44 +22,51 @@ impl Sender {
 
         Sender {
             conf,
-            client: reqwest::Client::new(),
+            client: Client::new(),
             sender: tx,
         }
     }
 
-    pub async fn run(&self) {
+    pub async fn run(&self, notify: Arc<Notify>) -> Result<(), String> {
         let mut rx = self.sender.subscribe();
 
-        while let event = rx.recv().await {
-            // info!("send queue = {}", event.unwrap().message);
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let mut events = Vec::new();
 
-            let mut events = Vec::new();
+                    events.push(event.unwrap());
 
-            events.push(event.unwrap());
+                    let resp = self
+                        .client
+                        .post(
+                            self.conf.es.host.clone()
+                                + ":"
+                                + self.conf.es.port.to_string().as_str()
+                                + "/"
+                                + self.conf.es.index_name.as_str()
+                                + "-"
+                                + Utc::now().format("%Y.%m.%d").to_string().as_str()
+                                + "/_bulk",
+                        )
+                        .body(self.make_body(events).await)
+                        .header("Content-Type", "application/json")
+                        .send()
+                        .await
+                        .unwrap(); // todo: handle error
 
-            let resp = self
-                .client
-                .post(
-                    self.conf.es.host.clone()
-                        + ":"
-                        + self.conf.es.port.to_string().as_str()
-                        + "/"
-                        + self.conf.es.index_name.as_str()
-                        + "-"
-                        + Utc::now().format("%Y.%m.%d").to_string().as_str()
-                        + "/_bulk",
-                )
-                .body(self.make_body(events).await)
-                .header("Content-Type", "application/json")
-                .send()
-                .await
-                .unwrap();
+                    warn!(
+                        "es resp: {}, {}",
+                        resp.status().to_string(),
+                        resp.text().await.unwrap().as_str()
+                    );
+                }
+                 _ = notify.notified() => {
+                    log::info!("sender received shutdown signal");
 
-            warn!(
-                "{}, {}",
-                resp.status().to_string(),
-                resp.text().await.unwrap().as_str()
-            );
+                    return Ok(())
+                }
+            }
         }
     }
 

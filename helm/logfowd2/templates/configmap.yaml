@@ -8,7 +8,7 @@ data:
   config.json: |
     {
       "log_path": "{{ .Values.app.logs_path }}",
-      "debug_mode": {{ .Values.app.debug_mode }},
+      "is_debug": {{ .Values.app.debug_mode }},
       "es": {
         "host": "{{ .Values.app.elasticsearch.host }}",
         "port": {{ .Values.app.elasticsearch.port }},

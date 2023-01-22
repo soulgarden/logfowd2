@@ -23,3 +23,19 @@ services:
     networks:
       default:
         ipv4_address: 160.25.100.2
+
+  zinc:
+    container_name: zinc
+    image: public.ecr.aws/zinclabs/zinc:latest
+    restart: always
+    environment:
+      ZINC_FIRST_ADMIN_USER: admin
+      ZINC_FIRST_ADMIN_PASSWORD: password
+      ZINC_DATA_PATH: /data
+    expose:
+      - 4080
+    ports:
+      - "4080:4080"
+    networks:
+      default:
+        ipv4_address: 160.25.100.3
