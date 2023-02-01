@@ -28,7 +28,7 @@ impl File {
 
             match line {
                 Ok(Some(line)) => {
-                    info!("{}", line);
+                    info!("skip {}", line);
 
                     continue;
                 }

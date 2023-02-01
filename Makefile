@@ -1,5 +1,8 @@
 fmt:
-	cargo fmt
+	cargo fmt --all
+
+lint:
+	cargo clippy --fix --allow-dirty
 
 #docker
 

@@ -6,6 +6,7 @@
     "port": 9200,
     "index_name": "logfowd",
     "flush_interval": 1000,
+    "bulk_size": 1000,
     "workers": 1
   }
 }

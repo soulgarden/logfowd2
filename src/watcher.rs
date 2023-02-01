@@ -13,26 +13,25 @@ use regex::Regex;
 use tokio::sync::mpsc::channel;
 use tokio::sync::Notify;
 
-use crate::events::Meta;
+use crate::events::{Event, Meta};
 use crate::file::File;
-use crate::sender::Sender;
 use crate::Conf;
 
 const K8S_PODS_REGEXP: &str = r"^/var/log/pods/(?P<namespace>[a-z0-9-]+)_(?P<pod_name>[a-z0-9-]+)_(?P<pod_id>[a-z0-9-]+)/(?P<container_name>[a-z-0-9]+)/(?P<num>[0-9]+).log$";
 
 pub struct Watcher {
     conf: Conf,
-    sender: Arc<Sender>,
     files: HashMap<String, File>,
+    process_queue_sender: async_channel::Sender<Event>,
     regexp: Regex,
 }
 
 impl Watcher {
-    pub fn new(conf: Conf, sender: Arc<Sender>) -> Self {
+    pub fn new(conf: Conf, process_queue_sender: async_channel::Sender<Event>) -> Self {
         Watcher {
             conf,
-            sender,
             files: HashMap::new(),
+            process_queue_sender,
             regexp: Regex::new(K8S_PODS_REGEXP).unwrap(),
         }
     }
@@ -46,11 +45,11 @@ impl Watcher {
             return Err(Error::generic("log_path must be absolute path"));
         }
 
-        info!("watching for {}", path.clone().display());
+        info!("watching for {}", path.display());
 
-        self.sync_files(path.clone()).await;
+        self.sync_files(path).await;
 
-        if let Err(e) = self.watch(path.clone(), notify).await {
+        if let Err(e) = self.watch(path, notify).await {
             error!("error: {:?}", e);
 
             return Err(e);
@@ -59,7 +58,7 @@ impl Watcher {
         Ok(())
     }
 
-    async fn watch(&mut self, path: &Path, notify: Arc<Notify>) -> notify::Result<()> {
+    async fn watch(&mut self, path: &Path, shoutdown: Arc<Notify>) -> notify::Result<()> {
         let (tx, mut rx) = channel(1024);
 
         let mut watcher =
@@ -76,7 +75,7 @@ impl Watcher {
 
                             match event.kind {
                                 EventKind::Create(_file) => {
-                                    let file = self.create_file(&path).await;
+                                    let file = self.create_file(path).await;
 
                                     if file.is_err() {
                                         warn!("error opening file: {}", file.err().unwrap());
@@ -89,7 +88,7 @@ impl Watcher {
                                     let events: Vec<crate::events::Event> = file.read_line().await;
 
                                     for event in events {
-                                        self.sender.send(event).await;
+                                        self.process_queue_sender.send(event).await.unwrap();
                                     }
 
                                     self.files.insert(event.paths[0].to_str().unwrap().to_string(), file);
@@ -102,7 +101,7 @@ impl Watcher {
                                             let events: Vec<crate::events::Event> = file.read_line().await;
 
                                             for event in events {
-                                                self.sender.send(event).await;
+                                                self.process_queue_sender.send(event).await.unwrap();
                                             }
                                         }
                                         None => {
@@ -127,8 +126,8 @@ impl Watcher {
                         Err(e) => info!("watch error: {:?}", e),
                     }
                 }
-                _ = notify.notified() => {
-                    log::info!("sender received shutdown signal");
+                _ = shoutdown.notified() => {
+                    log::info!("watcher received shutdown signal");
 
                     return Ok(())
                 }
@@ -147,13 +146,13 @@ impl Watcher {
                     if path.is_dir() {
                         self.sync_files(&path).await;
                     } else {
-                        let file = self.create_file(&path).await.unwrap();
+                        let mut file = self.create_file(&path).await.unwrap();
+
+                        file.read_lines().await;
 
                         self.files.insert(path.to_str().unwrap().to_string(), file);
 
                         debug!("file inserted: {}", path.to_str().unwrap());
-
-                        // seek to the end
                     }
                 }
             }

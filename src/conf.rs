@@ -29,6 +29,7 @@ pub struct ES {
     pub port: u16,
     pub index_name: String,
     pub flush_interval: u64,
+    pub bulk_size: usize,
     pub workers: u16,
 }
 
@@ -40,7 +41,7 @@ impl Conf {
         };
 
         let file = File::open(path).map_err(|e| ConfError {
-            message: format!("can't open config.json file, {}", e.to_string()),
+            message: format!("can't open config.json file, {e}"),
         })?;
 
         let mut buf_reader = BufReader::new(file);
@@ -50,13 +51,13 @@ impl Conf {
         buf_reader
             .read_to_string(&mut contents)
             .map_err(|e| ConfError {
-                message: format!("can't read config.json file, {}", e),
+                message: format!("can't read config.json file, {e}"),
             })?;
 
         let conf: Conf = serde_json::from_str(contents.as_str()).map_err(|e| ConfError {
-            message: format!("can't parse config.json file, {}", e),
+            message: format!("can't parse config.json file, {e}"),
         })?;
 
-        return Ok(conf);
+        Ok(conf)
     }
 }
