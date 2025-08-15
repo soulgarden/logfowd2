@@ -9,11 +9,24 @@ data:
     {
       "log_path": "{{ .Values.app.logs_path }}",
       "is_debug": {{ .Values.app.debug_mode }},
+      "state_file_path": "{{ .Values.app.state_file_path }}",
+      "read_existing_on_startup": {{ .Values.app.read_existing_on_startup | default false }},
+      "read_chunk_size": {{ .Values.app.read_chunk_size | default 200 }},
+      "max_line_size": {{ .Values.app.max_line_size | default 1048576 }},
+      "max_concurrent_file_readers": {{ .Values.app.max_concurrent_file_readers }},
+      "channels": {
+        "watcher_buffer_size": {{ .Values.app.channels.watcher_buffer_size }},
+        "es_buffer_size": {{ .Values.app.channels.es_buffer_size }},
+        "backpressure_threshold": {{ .Values.app.channels.backpressure_threshold }},
+        "backpressure_min_delay_ms": {{ .Values.app.channels.backpressure_min_delay_ms | default 5 }},
+        "backpressure_max_delay_ms": {{ .Values.app.channels.backpressure_max_delay_ms | default 60 }}
+      },
       "es": {
         "host": "{{ .Values.app.elasticsearch.host }}",
         "port": {{ .Values.app.elasticsearch.port }},
         "index_name": "{{ .Values.app.elasticsearch.index_name }}",
         "flush_interval": {{ .Values.app.elasticsearch.flush_interval }},
+        "bulk_size": {{ .Values.app.elasticsearch.bulk_size }},
         "workers": {{ .Values.app.elasticsearch.workers }}
       }
     }

@@ -8,7 +8,7 @@ image:
   repository: soulgarden/logfowd2
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "0.0.3"
+  tag: "0.0.7"
 
 imagePullSecrets: [ ]
 nameOverride: ""
@@ -77,11 +77,23 @@ tolerations: [ ]
 
 app:
   env: prod
-  debug_mode: true
+  debug_mode: false
+  state_file_path: "/tmp/logfowd2_state.json"
+  read_existing_on_startup: false
+  read_chunk_size: 100
+  max_line_size: 524288
+  max_concurrent_file_readers: 3
+  channels:
+    watcher_buffer_size: 300
+    es_buffer_size: 60
+    backpressure_threshold: 0.8
+    backpressure_min_delay_ms: 5
+    backpressure_max_delay_ms: 60
   elasticsearch:
     host: http://elasticsearch-master
     port: 9200
     index_name: logfowd
     flush_interval: 1000
-    workers: 10
+    bulk_size: 500
+    workers: 1
   logs_path: "/var/log/pods"

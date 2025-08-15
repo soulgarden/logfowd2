@@ -1,12 +1,24 @@
 {
   "log_path": "/var/log/pods",
-  "is_debug": true,
+  "is_debug": false,
+  "state_file_path": "/tmp/logfowd2_state.json",
+  "read_existing_on_startup": false,
+  "read_chunk_size": 200,
+  "max_line_size": 1048576,
+  "max_concurrent_file_readers": 10,
+  "channels": {
+    "watcher_buffer_size": 300,
+    "es_buffer_size": 30,
+    "backpressure_threshold": 0.7,
+    "backpressure_min_delay_ms": 5,
+    "backpressure_max_delay_ms": 60
+  },
   "es": {
     "host": "http://127.0.0.1",
     "port": 9200,
     "index_name": "logfowd",
     "flush_interval": 1000,
-    "bulk_size": 1000,
+    "bulk_size": 300,
     "workers": 1
   }
 }
