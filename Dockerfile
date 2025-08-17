@@ -1,4 +1,4 @@
-FROM rust:1.67-alpine3.17 as builder
+FROM rust:1.89-alpine AS builder
 
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 
@@ -10,7 +10,7 @@ WORKDIR /tmp/rust/src/github.com/soulgarden/logfowd2
 
 RUN cargo build --target=x86_64-unknown-linux-musl --release
 
-FROM alpine:3.17
+FROM alpine:3.22
 
 RUN apk add --no-cache libgcc
 
