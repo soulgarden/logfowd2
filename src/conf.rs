@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
-use std::{env, fmt};
+use std::{env, fmt, fs, path::Path};
 
 use serde::Deserialize;
 
@@ -128,6 +128,29 @@ impl Conf {
 
     /// Validate the configuration for logical consistency
     pub fn validate(&self) -> Result<(), ConfError> {
+        // Validate Elasticsearch configuration
+        self.validate_es_config()?;
+
+        // Validate paths
+        self.validate_paths()?;
+
+        // Validate channel configuration
+        self.validate_channels()?;
+
+        // Validate performance parameters
+        self.validate_performance_params()?;
+
+        // Validate metrics configuration
+        self.validate_metrics_config()?;
+
+        // Validate logging configuration
+        self.validate_logging_config()?;
+
+        Ok(())
+    }
+
+    /// Validate Elasticsearch configuration
+    fn validate_es_config(&self) -> Result<(), ConfError> {
         // Ensure at least one ES worker is configured
         if self.es.workers == 0 {
             return Err(ConfError {
@@ -140,6 +163,300 @@ impl Conf {
             return Err(ConfError {
                 message: "ES flush_interval must be greater than 0, got 0. Zero flush_interval causes tokio::time::interval to panic when creating the timer.".to_string(),
             });
+        }
+
+        // Validate ES host URL format
+        if !self.es.host.starts_with("http://") && !self.es.host.starts_with("https://") {
+            return Err(ConfError {
+                message: format!(
+                    "ES host must start with http:// or https://, got: '{}'",
+                    self.es.host
+                ),
+            });
+        }
+
+        // Basic URL validation - check for valid characters
+        if self.es.host.contains(' ') {
+            return Err(ConfError {
+                message: format!("ES host URL cannot contain spaces, got: '{}'", self.es.host),
+            });
+        }
+
+        // Validate ES port range
+        if self.es.port == 0 {
+            return Err(ConfError {
+                message: format!("ES port must be in range 1-65535, got: {}", self.es.port),
+            });
+        }
+
+        // Validate ES index name
+        if self.es.index_name.is_empty() {
+            return Err(ConfError {
+                message: "ES index_name cannot be empty".to_string(),
+            });
+        }
+
+        // Check for invalid characters in index name (Elasticsearch naming rules)
+        if self.es.index_name.starts_with('-')
+            || self.es.index_name.starts_with('_')
+            || self.es.index_name.starts_with('+')
+        {
+            return Err(ConfError {
+                message: format!(
+                    "ES index_name cannot start with -, _, or +, got: '{}'",
+                    self.es.index_name
+                ),
+            });
+        }
+
+        if self
+            .es
+            .index_name
+            .chars()
+            .any(|c| c.is_uppercase() || c.is_whitespace())
+        {
+            return Err(ConfError {
+                message: format!(
+                    "ES index_name cannot contain uppercase letters or whitespace, got: '{}'",
+                    self.es.index_name
+                ),
+            });
+        }
+
+        // Validate bulk size
+        if self.es.bulk_size == 0 {
+            return Err(ConfError {
+                message: "ES bulk_size must be greater than 0, got 0".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validate path configuration
+    fn validate_paths(&self) -> Result<(), ConfError> {
+        // Validate log_path exists and is readable
+        let log_path = Path::new(&self.log_path);
+        if !log_path.exists() {
+            return Err(ConfError {
+                message: format!("log_path does not exist: '{}'", self.log_path),
+            });
+        }
+
+        if !log_path.is_dir() {
+            return Err(ConfError {
+                message: format!(
+                    "log_path must be a directory, got file: '{}'",
+                    self.log_path
+                ),
+            });
+        }
+
+        // Check if directory is readable
+        if fs::read_dir(log_path).is_err() {
+            return Err(ConfError {
+                message: format!("log_path is not readable: '{}'", self.log_path),
+            });
+        }
+
+        // Validate state_file_path parent directory if specified
+        if let Some(state_path) = &self.state_file_path {
+            let state_path = Path::new(state_path);
+            let parent_dir = state_path.parent().unwrap_or(Path::new("/tmp"));
+
+            if !parent_dir.exists() {
+                return Err(ConfError {
+                    message: format!(
+                        "state_file_path parent directory does not exist: '{}'",
+                        parent_dir.display()
+                    ),
+                });
+            }
+
+            // Test if parent directory is writable by trying to create a temporary file
+            let test_file = parent_dir.join(".logfowd2_write_test");
+            match fs::write(&test_file, b"test") {
+                Ok(_) => {
+                    let _ = fs::remove_file(&test_file); // Clean up test file
+                }
+                Err(_) => {
+                    return Err(ConfError {
+                        message: format!(
+                            "state_file_path parent directory is not writable: '{}'",
+                            parent_dir.display()
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate channel configuration
+    fn validate_channels(&self) -> Result<(), ConfError> {
+        if let Some(channels) = &self.channels {
+            // Validate buffer sizes are greater than 0
+            if let Some(watcher_buffer_size) = channels.watcher_buffer_size
+                && watcher_buffer_size == 0 {
+                    return Err(ConfError {
+                        message: "watcher_buffer_size must be greater than 0, got 0".to_string(),
+                    });
+                }
+
+            if let Some(es_buffer_size) = channels.es_buffer_size
+                && es_buffer_size == 0 {
+                    return Err(ConfError {
+                        message: "es_buffer_size must be greater than 0, got 0".to_string(),
+                    });
+                }
+
+            // Validate backpressure threshold is in valid range
+            if let Some(threshold) = channels.backpressure_threshold {
+                if threshold.is_nan() {
+                    return Err(ConfError {
+                        message: "backpressure_threshold cannot be NaN".to_string(),
+                    });
+                }
+                if threshold.is_infinite() {
+                    return Err(ConfError {
+                        message: format!(
+                            "backpressure_threshold cannot be infinite, got: {}",
+                            threshold
+                        ),
+                    });
+                }
+                if !(0.0..=1.0).contains(&threshold) {
+                    return Err(ConfError {
+                        message: format!(
+                            "backpressure_threshold must be in range 0.0-1.0, got: {}",
+                            threshold
+                        ),
+                    });
+                }
+            }
+
+            // Validate backpressure delay ordering
+            if let (Some(min_delay), Some(max_delay)) = (
+                channels.backpressure_min_delay_ms,
+                channels.backpressure_max_delay_ms,
+            )
+                && min_delay > max_delay {
+                    return Err(ConfError {
+                        message: format!(
+                            "backpressure_min_delay_ms ({}) must be <= backpressure_max_delay_ms ({})",
+                            min_delay, max_delay
+                        ),
+                    });
+                }
+
+            // Validate notify buffer sizes
+            if let Some(notify_buffer_size) = channels.notify_buffer_max_size
+                && notify_buffer_size == 0 {
+                    return Err(ConfError {
+                        message: "notify_buffer_max_size must be greater than 0, got 0".to_string(),
+                    });
+                }
+
+            if let Some(notify_fs_buffer_size) = channels.notify_filesystem_buffer_size
+                && notify_fs_buffer_size == 0 {
+                    return Err(ConfError {
+                        message: "notify_filesystem_buffer_size must be greater than 0, got 0"
+                            .to_string(),
+                    });
+                }
+        }
+
+        Ok(())
+    }
+
+    /// Validate performance parameters
+    fn validate_performance_params(&self) -> Result<(), ConfError> {
+        // Validate read_chunk_size
+        if let Some(chunk_size) = self.read_chunk_size
+            && chunk_size == 0 {
+                return Err(ConfError {
+                    message: "read_chunk_size must be greater than 0, got 0".to_string(),
+                });
+            }
+
+        // Validate max_line_size
+        if let Some(max_line_size) = self.max_line_size
+            && max_line_size == 0 {
+                return Err(ConfError {
+                    message: "max_line_size must be greater than 0, got 0".to_string(),
+                });
+            }
+
+        // Validate max_concurrent_file_readers
+        if let Some(max_readers) = self.max_concurrent_file_readers
+            && max_readers == 0 {
+                return Err(ConfError {
+                    message: "max_concurrent_file_readers must be greater than 0, got 0"
+                        .to_string(),
+                });
+            }
+
+        Ok(())
+    }
+
+    /// Validate metrics configuration
+    fn validate_metrics_config(&self) -> Result<(), ConfError> {
+        if let Some(metrics) = &self.metrics {
+            // Validate metrics port range
+            if let Some(port) = metrics.port
+                && port == 0 {
+                    return Err(ConfError {
+                        message: format!("metrics.port must be in range 1-65535, got: {}", port),
+                    });
+                }
+
+            // Validate metrics path format
+            if let Some(path) = &metrics.path {
+                if path.is_empty() {
+                    return Err(ConfError {
+                        message: "metrics.path cannot be empty".to_string(),
+                    });
+                }
+                if !path.starts_with('/') {
+                    return Err(ConfError {
+                        message: format!("metrics.path must start with '/', got: '{}'", path),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate logging configuration
+    fn validate_logging_config(&self) -> Result<(), ConfError> {
+        if let Some(logging) = &self.logging {
+            // Validate log level
+            if let Some(level) = &logging.level {
+                let valid_levels = ["trace", "debug", "info", "warn", "error"];
+                if !valid_levels.contains(&level.as_str()) {
+                    return Err(ConfError {
+                        message: format!(
+                            "logging.level must be one of [trace, debug, info, warn, error], got: '{}'",
+                            level
+                        ),
+                    });
+                }
+            }
+
+            // Validate log format
+            if let Some(format) = &logging.format {
+                let valid_formats = ["simple", "structured"];
+                if !valid_formats.contains(&format.as_str()) {
+                    return Err(ConfError {
+                        message: format!(
+                            "logging.format must be one of [simple, structured], got: '{}'",
+                            format
+                        ),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -599,7 +916,7 @@ mod tests {
         let config_json = r#"
         {
             "is_debug": false,
-            "log_path": "/test",
+            "log_path": "/tmp",
             "es": {
                 "host": "http://localhost",
                 "port": 9200,
@@ -627,7 +944,7 @@ mod tests {
         let config_json = r#"
         {
             "is_debug": false,
-            "log_path": "/test",
+            "log_path": "/tmp",
             "es": {
                 "host": "http://localhost",
                 "port": 9200,
@@ -692,7 +1009,7 @@ mod tests {
         let config_json = r#"
         {
             "is_debug": false,
-            "log_path": "/test",
+            "log_path": "/tmp",
             "es": {
                 "host": "http://localhost",
                 "port": 9200,
@@ -712,6 +1029,611 @@ mod tests {
         assert!(
             validation_result.is_ok(),
             "Expected validation to pass for positive flush_interval"
+        );
+    }
+
+    // ES Host Validation Tests
+    #[test]
+    fn test_invalid_es_host_no_protocol() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "elasticsearch.local",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("ES host must start with http://")
+        );
+    }
+
+    #[test]
+    fn test_valid_es_host_https() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "https://elasticsearch.example.com",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_ok());
+    }
+
+    #[test]
+    fn test_invalid_es_host_with_spaces() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "http://elasticsearch local",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("cannot contain spaces")
+        );
+    }
+
+    // ES Port Validation Tests
+    #[test]
+    fn test_invalid_es_port_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "http://localhost",
+                "port": 0,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("port must be in range 1-65535")
+        );
+    }
+
+    // Note: test_invalid_es_port_too_high is not needed because u16 cannot exceed 65535
+
+    // ES Index Name Validation Tests
+    #[test]
+    fn test_invalid_es_index_empty() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("index_name cannot be empty")
+        );
+    }
+
+    #[test]
+    fn test_invalid_es_index_starts_with_dash() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "-test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("cannot start with -, _, or +")
+        );
+    }
+
+    #[test]
+    fn test_invalid_es_index_uppercase() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "TestIndex",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("cannot contain uppercase letters")
+        );
+    }
+
+    // ES Bulk Size Validation Tests
+    #[test]
+    fn test_invalid_es_bulk_size_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 0,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("bulk_size must be greater than 0")
+        );
+    }
+
+    // Path Validation Tests
+    #[test]
+    fn test_invalid_log_path_not_exist() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/nonexistent/path",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("log_path does not exist")
+        );
+    }
+
+    // Channel Validation Tests
+    #[test]
+    fn test_invalid_watcher_buffer_size_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "channels": {
+                "watcher_buffer_size": 0
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("watcher_buffer_size must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_invalid_backpressure_threshold_range() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "channels": {
+                "backpressure_threshold": 1.5
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("backpressure_threshold must be in range 0.0-1.0")
+        );
+    }
+
+    #[test]
+    fn test_invalid_backpressure_delay_ordering() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "channels": {
+                "backpressure_min_delay_ms": 100,
+                "backpressure_max_delay_ms": 50
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        let error = validation_result.unwrap_err();
+        assert!(error.message.contains("backpressure_min_delay_ms"));
+        assert!(error.message.contains("backpressure_max_delay_ms"));
+    }
+
+    // Performance Parameters Tests
+    #[test]
+    fn test_invalid_read_chunk_size_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "read_chunk_size": 0,
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("read_chunk_size must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_invalid_max_line_size_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "max_line_size": 0,
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("max_line_size must be greater than 0")
+        );
+    }
+
+    #[test]
+    fn test_invalid_max_concurrent_file_readers_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "max_concurrent_file_readers": 0,
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("max_concurrent_file_readers must be greater than 0")
+        );
+    }
+
+    // Metrics Configuration Tests
+    #[test]
+    fn test_invalid_metrics_port_zero() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "metrics": {
+                "enabled": true,
+                "port": 0
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("metrics.port must be in range 1-65535")
+        );
+    }
+
+    #[test]
+    fn test_invalid_metrics_path_no_slash() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "metrics": {
+                "enabled": true,
+                "path": "metrics"
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        assert!(
+            validation_result
+                .unwrap_err()
+                .message
+                .contains("metrics.path must start with '/'")
+        );
+    }
+
+    // Logging Configuration Tests
+    #[test]
+    fn test_invalid_logging_level() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "logging": {
+                "level": "verbose"
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        let error = validation_result.unwrap_err();
+        assert!(error.message.contains("logging.level must be one of"));
+        assert!(error.message.contains("verbose"));
+    }
+
+    #[test]
+    fn test_invalid_logging_format() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/tmp",
+            "logging": {
+                "format": "json"
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(validation_result.is_err());
+        let error = validation_result.unwrap_err();
+        assert!(error.message.contains("logging.format must be one of"));
+        assert!(error.message.contains("json"));
+    }
+
+    // Valid Configuration Test
+    #[test]
+    fn test_comprehensive_valid_config() {
+        let config_json = r#"
+        {
+            "is_debug": true,
+            "log_path": "/tmp",
+            "state_file_path": "/tmp/test_state.json",
+            "read_existing_on_startup": true,
+            "read_chunk_size": 200,
+            "max_line_size": 1048576,
+            "max_concurrent_file_readers": 10,
+            "channels": {
+                "watcher_buffer_size": 1000,
+                "es_buffer_size": 100,
+                "backpressure_threshold": 0.8,
+                "backpressure_min_delay_ms": 10,
+                "backpressure_max_delay_ms": 100,
+                "notify_buffer_max_size": 2000,
+                "notify_filesystem_buffer_size": 1024
+            },
+            "metrics": {
+                "enabled": true,
+                "port": 9090,
+                "path": "/metrics"
+            },
+            "logging": {
+                "level": "info",
+                "format": "structured"
+            },
+            "es": {
+                "host": "https://elasticsearch.example.com",
+                "port": 9200,
+                "index_name": "logfowd-test",
+                "flush_interval": 5000,
+                "bulk_size": 500,
+                "workers": 3
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_ok(),
+            "Valid config should pass validation: {:?}",
+            validation_result.err()
         );
     }
 }

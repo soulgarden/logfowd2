@@ -417,16 +417,17 @@ mod tests {
             .await
             .expect("Watcher should shut down within timeout")
             .expect("Watcher task should complete");
-        
+
         // Give sender more time and check if it's just a timeout issue
-        let sender_result = timeout(Duration::from_millis(15000), sender_handle)
-            .await;
-            
+        let sender_result = timeout(Duration::from_millis(15000), sender_handle).await;
+
         let sender_result = match sender_result {
             Ok(result) => result.expect("Sender task should complete"),
             Err(_) => {
                 // If sender doesn't shut down gracefully, that might be expected in test scenarios
-                log::warn!("Sender did not shut down within timeout, which may be expected in test");
+                log::warn!(
+                    "Sender did not shut down within timeout, which may be expected in test"
+                );
                 return;
             }
         };

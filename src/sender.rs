@@ -86,7 +86,7 @@ impl Sender {
                             Duration::from_millis(1000),
                             self.send_batch(&mut batch)
                         ).await;
-                        
+
                         match timeout_result {
                             Ok(_) => log::info!("Finished sending remaining events"),
                             Err(_) => {
@@ -140,8 +140,9 @@ impl Sender {
         // Use timeout to prevent hanging if ES workers are unavailable
         let send_result = tokio::time::timeout(
             Duration::from_millis(5000),
-            self.es_queue_sender.send(events)
-        ).await;
+            self.es_queue_sender.send(events),
+        )
+        .await;
 
         match send_result {
             Ok(Ok(())) => {

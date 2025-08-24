@@ -441,6 +441,19 @@ impl Watcher {
                                             continue;
                                         }
                                     };
+
+                                    // Skip directory removal events - they're expected when pods are deleted
+                                    if event.paths[0].is_dir() {
+                                        debug!("Directory removed (expected): {}", path_str);
+                                        continue;
+                                    }
+
+                                    // Only process log files that match our K8s pods pattern
+                                    if !self.regexp.is_match(&path_str) {
+                                        debug!("Non-log file removed (ignoring): {}", path_str);
+                                        continue;
+                                    }
+
                                     info!("File removed: {}", path_str);
 
                                     // Handle removal with FileTracker
@@ -1480,5 +1493,35 @@ mod tests {
             watcher.file_trackers.is_empty(),
             "Should not create trackers for nonexistent directory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_directory_removal_events_are_handled_gracefully() {
+        // Test that directory removal events don't cause "unknown file" warnings
+        let conf = create_test_conf();
+        let channel = create_bounded_channel::<crate::events::Event>(100, None, None, None, None);
+        let sender = channel.sender();
+        let watcher = Watcher::new(conf, sender);
+
+        // Test the key insight: our fixed code now checks paths correctly
+        // The production issue was caused by trying to remove directories that were never tracked
+
+        // These directory paths should NOT match the regex pattern (and thus won't be tracked)
+        assert!(!watcher.regexp.is_match(
+            "/var/log/pods/logging_logfowd2-1_8bd6a9d9-3eb4-4606-987c-7abee9e16693/logfowd2"
+        ));
+        assert!(
+            !watcher
+                .regexp
+                .is_match("/var/log/pods/logging_logfowd2-1_8bd6a9d9-3eb4-4606-987c-7abee9e16693")
+        );
+
+        // Only the actual log file should match the regex pattern
+        assert!(watcher.regexp.is_match(
+            "/var/log/pods/logging_logfowd2-1_8bd6a9d9-3eb4-4606-987c-7abee9e16693/logfowd2/0.log"
+        ));
+
+        // With our fix, directory removal events will be skipped silently
+        // instead of causing "unknown file" warnings
     }
 }

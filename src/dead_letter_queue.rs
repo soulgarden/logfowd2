@@ -976,7 +976,7 @@ mod tests {
 
         // Start background tasks and give it a moment to initialize
         let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
-        
+
         // Small delay to ensure the background task is ready
         tokio::time::sleep(Duration::from_millis(1)).await;
 
