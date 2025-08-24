@@ -21,7 +21,7 @@ impl MetricsServer {
     }
 
     pub async fn run(&self, shutdown: Arc<Notify>) -> Result<(), Box<dyn std::error::Error>> {
-        let enabled = self.config.enabled.unwrap_or(true);
+        let enabled = self.config.enabled.unwrap_or(false);
         if !enabled {
             info!("Metrics server disabled in configuration");
             return Ok(());
@@ -105,6 +105,67 @@ mod tests {
         assert!(
             result.unwrap().is_ok(),
             "Disabled server should not return error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_server_default_disabled() {
+        // Test with enabled: None to verify default behavior
+        let config = MetricsConfig {
+            enabled: None, // This should default to false (disabled)
+            port: Some(9092),
+            path: Some("/test-default-metrics".to_string()),
+        };
+
+        let server = MetricsServer::new(config);
+        let shutdown = Arc::new(Notify::new());
+
+        // Server should return immediately when enabled is None (defaults to disabled)
+        let result = timeout(Duration::from_millis(100), server.run(shutdown)).await;
+
+        assert!(
+            result.is_ok(),
+            "Server should complete quickly when enabled is None (defaults to disabled)"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "Default disabled server should not return error"
+        );
+    }
+
+    #[test]
+    fn test_consistency_with_are_metrics_enabled() {
+        use crate::metrics::are_metrics_enabled;
+
+        // Test that both functions have the same default behavior
+        let config_none: Option<MetricsConfig> = None;
+        let config_enabled_none = Some(MetricsConfig {
+            enabled: None,
+            port: Some(9090),
+            path: Some("/metrics".to_string()),
+        });
+
+        // Both should return false when config is None or enabled is None
+        assert_eq!(
+            are_metrics_enabled(&config_none),
+            false,
+            "are_metrics_enabled should default to false when config is None"
+        );
+        assert_eq!(
+            are_metrics_enabled(&config_enabled_none),
+            false,
+            "are_metrics_enabled should default to false when enabled is None"
+        );
+
+        // Verify that unwrap_or(false) in metrics_server matches this behavior
+        assert_eq!(
+            config_enabled_none
+                .as_ref()
+                .unwrap()
+                .enabled
+                .unwrap_or(false),
+            false,
+            "metrics_server should also default to false when enabled is None"
         );
     }
 

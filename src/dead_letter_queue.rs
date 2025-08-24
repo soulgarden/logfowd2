@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 use crate::events::Event;
@@ -168,7 +169,7 @@ impl DeadLetterQueue {
         Ok(())
     }
 
-    pub async fn start_background_tasks(&self) {
+    pub async fn start_background_tasks(&self, shutdown_notify: Arc<Notify>) -> JoinHandle<()> {
         let queue_clone = Arc::clone(&self.queue);
         let config_clone = self.config.clone();
         let stats_clone = Arc::clone(&self.stats); // Share the same stats instance for consistency
@@ -178,32 +179,54 @@ impl DeadLetterQueue {
             let mut interval = interval(config_clone.flush_interval);
 
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let dlq = DeadLetterQueue {
+                            config: config_clone.clone(),
+                            queue: queue_clone.clone(),
+                            stats: stats_clone.clone(), // Use shared stats to maintain consistency
+                        };
 
-                let dlq = DeadLetterQueue {
-                    config: config_clone.clone(),
-                    queue: queue_clone.clone(),
-                    stats: stats_clone.clone(), // Use shared stats to maintain consistency
-                };
+                        if let Err(e) = dlq.flush_to_disk().await {
+                            match e.kind() {
+                                std::io::ErrorKind::StorageFull => {
+                                    error!(
+                                        "Failed to flush dead letter queue due to insufficient disk space: {}",
+                                        e
+                                    );
+                                    warn!(
+                                        "Dead letter queue persistence is degraded due to disk space constraints"
+                                    );
+                                }
+                                _ => {
+                                    error!("Failed to flush dead letter queue to disk: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        info!("DLQ background flusher received shutdown signal");
 
-                if let Err(e) = dlq.flush_to_disk().await {
-                    match e.kind() {
-                        std::io::ErrorKind::StorageFull => {
-                            error!(
-                                "Failed to flush dead letter queue due to insufficient disk space: {}",
-                                e
-                            );
-                            warn!(
-                                "Dead letter queue persistence is degraded due to disk space constraints"
-                            );
+                        // Perform final flush before shutdown
+                        let dlq = DeadLetterQueue {
+                            config: config_clone.clone(),
+                            queue: queue_clone.clone(),
+                            stats: stats_clone.clone(),
+                        };
+
+                        if let Err(e) = dlq.flush_to_disk().await {
+                            error!("Failed final DLQ flush during shutdown: {}", e);
+                        } else {
+                            debug!("DLQ background flusher completed final flush");
                         }
-                        _ => {
-                            error!("Failed to flush dead letter queue to disk: {}", e);
-                        }
+
+                        break;
                     }
                 }
             }
-        });
+
+            info!("DLQ background flusher shutdown complete");
+        })
     }
 }
 
@@ -223,8 +246,10 @@ impl Clone for DeadLetterStats {
 mod tests {
     use super::*;
     use crate::events::{Event, Meta};
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::NamedTempFile;
+    use tokio::sync::Notify;
 
     fn create_test_event(message: &str) -> Event {
         Event::new(message.to_string(), Meta::default())
@@ -808,5 +833,163 @@ mod tests {
         let result = dlq.flush_to_disk().await;
         // Might fail due to path, but shouldn't panic
         assert!(result.is_ok() || result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_graceful_shutdown() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let file_path = temp_file.path().to_string_lossy().to_string();
+        let mut config = create_test_config_with_file(file_path.clone());
+        config.flush_interval = Duration::from_millis(100); // Fast flush for testing
+
+        let dlq = DeadLetterQueue::new(config);
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Add an event
+        let event = create_test_event("shutdown test");
+        dlq.add_failed_event(event, "shutdown test failure".to_string())
+            .await;
+
+        // Start background tasks
+        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+
+        // Give it time to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Signal shutdown
+        shutdown_notify.notify_waiters();
+
+        // Wait for graceful shutdown
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "Background task should shut down gracefully"
+        );
+
+        // Verify final flush occurred
+        assert!(std::path::Path::new(&file_path).exists());
+        let file_content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(file_content.contains("shutdown test"));
+    }
+
+    #[tokio::test]
+    async fn test_background_task_periodic_flush() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let file_path = temp_file.path().to_string_lossy().to_string();
+        let mut config = create_test_config_with_file(file_path.clone());
+        config.flush_interval = Duration::from_millis(50); // Very fast for testing
+
+        let dlq = DeadLetterQueue::new(config);
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Start background tasks
+        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+
+        // Add events over time
+        for i in 0..3 {
+            let event = create_test_event(&format!("periodic test {}", i));
+            dlq.add_failed_event(event, format!("periodic failure {}", i))
+                .await;
+            tokio::time::sleep(Duration::from_millis(60)).await; // Let flush happen
+        }
+
+        // Should have flushed multiple times by now
+        if std::path::Path::new(&file_path).exists() {
+            let file_content = std::fs::read_to_string(&file_path).unwrap();
+            assert!(file_content.contains("periodic test"));
+        }
+
+        // Clean shutdown
+        shutdown_notify.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_with_flush_error() {
+        // Test shutdown behavior when final flush fails
+        let invalid_path = "/invalid/directory/does/not/exist/dead_letters.json";
+        let config = create_test_config_with_file(invalid_path.to_string());
+        let dlq = DeadLetterQueue::new(config);
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Add an event
+        let event = create_test_event("error test");
+        dlq.add_failed_event(event, "error test failure".to_string())
+            .await;
+
+        // Start background tasks
+        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Signal shutdown (final flush will fail due to invalid path)
+        shutdown_notify.notify_waiters();
+
+        // Should still shut down gracefully despite flush error
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(
+            result.is_ok(),
+            "Should shut down gracefully even with flush errors"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multiple_shutdown_signals() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let file_path = temp_file.path().to_string_lossy().to_string();
+        let mut config = create_test_config_with_file(file_path.clone());
+        config.flush_interval = Duration::from_millis(200);
+
+        let dlq = DeadLetterQueue::new(config);
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Start background tasks
+        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Send multiple shutdown signals
+        shutdown_notify.notify_waiters();
+        shutdown_notify.notify_waiters();
+        shutdown_notify.notify_waiters();
+
+        // Should only handle the first one and exit cleanly
+        let result = tokio::time::timeout(Duration::from_millis(300), handle).await;
+        assert!(result.is_ok(), "Should handle multiple signals gracefully");
+    }
+
+    #[tokio::test]
+    async fn test_immediate_shutdown_before_first_flush() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let file_path = temp_file.path().to_string_lossy().to_string();
+        let mut config = create_test_config_with_file(file_path.clone());
+        config.flush_interval = Duration::from_secs(60); // Long interval
+
+        let dlq = DeadLetterQueue::new(config);
+        let shutdown_notify = Arc::new(Notify::new());
+
+        // Add an event
+        let event = create_test_event("immediate shutdown test");
+        dlq.add_failed_event(event, "immediate shutdown failure".to_string())
+            .await;
+
+        // Start background tasks and give it a moment to initialize
+        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+        
+        // Small delay to ensure the background task is ready
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // Signal shutdown immediately
+        shutdown_notify.notify_waiters();
+
+        // Should complete final flush and shutdown
+        let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(result.is_ok(), "Should handle immediate shutdown");
+
+        // Verify final flush occurred even though regular interval didn't fire
+        assert!(std::path::Path::new(&file_path).exists());
+        let file_content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(file_content.contains("immediate shutdown test"));
     }
 }

@@ -11,7 +11,21 @@
     "es_buffer_size": 30,
     "backpressure_threshold": 0.7,
     "backpressure_min_delay_ms": 5,
-    "backpressure_max_delay_ms": 60
+    "backpressure_max_delay_ms": 60,
+    "notify_buffer_warning_threshold": 1000,
+    "notify_buffer_max_size": 10000,
+    "notify_drop_on_overflow": true,
+    "notify_filesystem_buffer_warning_threshold": 1000,
+    "notify_filesystem_buffer_size": 1024
+  },
+  "metrics": {
+    "enabled": false,
+    "port": 9090,
+    "path": "/metrics"
+  },
+  "logging": {
+    "level": "info",
+    "format": "simple"
   },
   "es": {
     "host": "http://127.0.0.1",

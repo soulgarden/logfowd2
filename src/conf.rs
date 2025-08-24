@@ -16,6 +16,8 @@ impl fmt::Display for ConfError {
     }
 }
 
+impl std::error::Error for ConfError {}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Conf {
     pub is_debug: bool,
@@ -43,6 +45,13 @@ pub struct ChannelConfig {
     pub backpressure_threshold: Option<f32>,
     pub backpressure_min_delay_ms: Option<u64>,
     pub backpressure_max_delay_ms: Option<u64>,
+    // Notify callback configuration to prevent blocking (EventBridge)
+    pub notify_buffer_warning_threshold: Option<usize>,
+    pub notify_buffer_max_size: Option<usize>,
+    pub notify_drop_on_overflow: Option<bool>,
+    // NotifyBridge filesystem event configuration
+    pub notify_filesystem_buffer_warning_threshold: Option<usize>,
+    pub notify_filesystem_buffer_size: Option<usize>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -112,7 +121,28 @@ impl Conf {
             message: format!("can't parse config.json file, {e}"),
         })?;
 
+        conf.validate()?;
+
         Ok(conf)
+    }
+
+    /// Validate the configuration for logical consistency
+    pub fn validate(&self) -> Result<(), ConfError> {
+        // Ensure at least one ES worker is configured
+        if self.es.workers == 0 {
+            return Err(ConfError {
+                message: "ES workers count must be at least 1, got 0. Zero workers would cause deadlock as no receivers would be available for the work distribution channel.".to_string(),
+            });
+        }
+
+        // Ensure flush_interval is greater than 0 to prevent tokio::time::interval panic
+        if self.es.flush_interval == 0 {
+            return Err(ConfError {
+                message: "ES flush_interval must be greater than 0, got 0. Zero flush_interval causes tokio::time::interval to panic when creating the timer.".to_string(),
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -140,7 +170,10 @@ mod tests {
             "channels": {
                 "watcher_buffer_size": 5000,
                 "es_buffer_size": 2000,
-                "backpressure_threshold": 0.8
+                "backpressure_threshold": 0.8,
+                "notify_buffer_warning_threshold": 1000,
+                "notify_buffer_max_size": 10000,
+                "notify_drop_on_overflow": true
             },
             "es": {
                 "host": "http://localhost",
@@ -165,6 +198,9 @@ mod tests {
         assert_eq!(channels.watcher_buffer_size, Some(5000));
         assert_eq!(channels.es_buffer_size, Some(2000));
         assert_eq!(channels.backpressure_threshold, Some(0.8));
+        assert_eq!(channels.notify_buffer_warning_threshold, Some(1000));
+        assert_eq!(channels.notify_buffer_max_size, Some(10000));
+        assert_eq!(channels.notify_drop_on_overflow, Some(true));
 
         // Test ES config
         assert_eq!(conf.es.host, "http://localhost");
@@ -250,6 +286,9 @@ mod tests {
         assert_eq!(channels.watcher_buffer_size, Some(1000));
         assert_eq!(channels.es_buffer_size, None);
         assert_eq!(channels.backpressure_threshold, None);
+        assert_eq!(channels.notify_buffer_warning_threshold, None);
+        assert_eq!(channels.notify_buffer_max_size, None);
+        assert_eq!(channels.notify_drop_on_overflow, None);
     }
 
     #[test]
@@ -260,6 +299,11 @@ mod tests {
             backpressure_threshold: Some(0.8),
             backpressure_min_delay_ms: None,
             backpressure_max_delay_ms: None,
+            notify_buffer_warning_threshold: Some(1000),
+            notify_buffer_max_size: Some(10000),
+            notify_drop_on_overflow: Some(true),
+            notify_filesystem_buffer_warning_threshold: Some(1000),
+            notify_filesystem_buffer_size: Some(2048),
         };
 
         let cloned = channels.clone();
@@ -309,6 +353,11 @@ mod tests {
                 backpressure_threshold: Some(0.9),
                 backpressure_min_delay_ms: None,
                 backpressure_max_delay_ms: None,
+                notify_buffer_warning_threshold: None,
+                notify_buffer_max_size: None,
+                notify_drop_on_overflow: None,
+                notify_filesystem_buffer_warning_threshold: None,
+                notify_filesystem_buffer_size: None,
             }),
             metrics: None,
             logging: None,
@@ -392,10 +441,24 @@ mod tests {
         let conf: Conf = serde_json::from_str(config_json).unwrap();
 
         assert_eq!(conf.max_concurrent_file_readers, Some(0));
-        assert_eq!(conf.channels.unwrap().backpressure_threshold, Some(-0.5));
+        // Config can load negative values, but they will be validated/clamped
+        // when used in BoundedChannel::new()
+        assert_eq!(
+            conf.channels.as_ref().unwrap().backpressure_threshold,
+            Some(-0.5)
+        );
         assert_eq!(conf.es.port, 0);
         assert_eq!(conf.es.workers, 0);
+        assert_eq!(conf.es.flush_interval, 0);
         assert_eq!(conf.es.index_name, "");
+
+        // Note: This config would fail validation due to workers=0 and flush_interval=0
+        // but this test is only verifying JSON parsing, not validation
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_err(),
+            "Expected validation to fail due to workers=0 and flush_interval=0"
+        );
     }
 
     #[test]
@@ -447,5 +510,208 @@ mod tests {
         assert!(debug_str.contains("log_path: \"/test\""));
         assert!(debug_str.contains("state_file_path: None"));
         assert!(debug_str.contains("host: \"http://localhost\""));
+    }
+
+    #[test]
+    fn test_integration_config_with_negative_threshold() {
+        // This test verifies that even with a negative threshold in config,
+        // the actual channel behavior is corrected by validation
+        use crate::channels::create_bounded_channel;
+
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/test",
+            "channels": {
+                "watcher_buffer_size": 10,
+                "es_buffer_size": 5,
+                "backpressure_threshold": -0.3
+            },
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        let channels_config = conf.channels.unwrap();
+
+        // Config loads the negative value
+        assert_eq!(channels_config.backpressure_threshold, Some(-0.3));
+
+        // But when creating actual channel, the value gets validated/clamped
+        let channel: crate::channels::BoundedChannel<String> = create_bounded_channel(
+            10,
+            channels_config.es_buffer_size,
+            channels_config.backpressure_threshold,
+            None,
+            None,
+        );
+
+        // The channel should have a valid threshold (clamped to 0.0)
+        assert_eq!(channel.backpressure_threshold(), 0.0);
+    }
+
+    #[test]
+    fn test_zero_workers_validation() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/test",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 0
+            }
+        }
+        "#;
+
+        // Config should parse successfully
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        assert_eq!(conf.es.workers, 0);
+
+        // But validation should fail
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_err(),
+            "Expected validation to fail for zero workers"
+        );
+
+        let error = validation_result.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("ES workers count must be at least 1")
+        );
+        assert!(error.message.contains("Zero workers would cause deadlock"));
+    }
+
+    #[test]
+    fn test_valid_workers_validation() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/test",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        assert_eq!(conf.es.workers, 1);
+
+        // Validation should pass
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_ok(),
+            "Expected validation to pass for one or more workers"
+        );
+    }
+
+    #[test]
+    fn test_multiple_workers_validation() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/test",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1000,
+                "bulk_size": 100,
+                "workers": 5
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        assert_eq!(conf.es.workers, 5);
+
+        // Validation should pass
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_ok(),
+            "Expected validation to pass for multiple workers"
+        );
+    }
+
+    #[test]
+    fn test_zero_flush_interval_validation() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/test",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 0,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        // Config should parse successfully
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        assert_eq!(conf.es.flush_interval, 0);
+
+        // But validation should fail
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_err(),
+            "Expected validation to fail for zero flush_interval"
+        );
+
+        let error = validation_result.unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("flush_interval must be greater than 0")
+        );
+        assert!(error.message.contains("tokio::time::interval"));
+    }
+
+    #[test]
+    fn test_valid_flush_interval_validation() {
+        let config_json = r#"
+        {
+            "is_debug": false,
+            "log_path": "/test",
+            "es": {
+                "host": "http://localhost",
+                "port": 9200,
+                "index_name": "test",
+                "flush_interval": 1,
+                "bulk_size": 100,
+                "workers": 1
+            }
+        }
+        "#;
+
+        let conf: Conf = serde_json::from_str(config_json).unwrap();
+        assert_eq!(conf.es.flush_interval, 1);
+
+        // Validation should pass
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_ok(),
+            "Expected validation to pass for positive flush_interval"
+        );
     }
 }

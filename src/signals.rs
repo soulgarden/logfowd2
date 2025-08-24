@@ -4,11 +4,13 @@ use libc::{SIGINT, SIGTERM};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
 
-pub fn listen_signals() -> Arc<Notify> {
+use crate::error::Result;
+
+pub fn listen_signals() -> Result<Arc<Notify>> {
     let notify = Arc::new(Notify::new());
 
     for &signum in [SIGTERM, SIGINT].iter() {
-        let mut sig = tokio::signal::unix::signal(SignalKind::from_raw(signum)).unwrap();
+        let mut sig = tokio::signal::unix::signal(SignalKind::from_raw(signum))?;
 
         let notify = notify.clone();
 
@@ -23,7 +25,7 @@ pub fn listen_signals() -> Arc<Notify> {
 
     log::info!("waiting for signal");
 
-    notify
+    Ok(notify)
 }
 
 #[cfg(test)]
@@ -35,7 +37,7 @@ mod tests {
     #[tokio::test]
     async fn test_listen_signals_creates_notify() {
         // Test that listen_signals returns a valid Notify object
-        let notify = listen_signals();
+        let notify = listen_signals().unwrap();
 
         // Should be able to clone the Arc
         let notify_clone = notify.clone();
@@ -179,6 +181,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_listen_signals_error_handling() {
+        // Test that listen_signals returns a Result and can be handled properly
+        let result = listen_signals();
+
+        // On most systems this should succeed, but we test the error handling pattern
+        match result {
+            Ok(notify) => {
+                // Verify we got a working notify object
+                assert!(Arc::ptr_eq(&notify, &notify.clone()));
+            }
+            Err(e) => {
+                // If it fails, verify we get a proper error type
+                // This would happen if signal setup fails (e.g., insufficient permissions)
+                eprintln!(
+                    "Signal initialization failed (expected in some environments): {}",
+                    e
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_notify_clone_independence() {
         // Test that cloned notifiers work independently for different patterns
         let original = Arc::new(Notify::new());
@@ -246,7 +270,7 @@ mod tests {
     #[tokio::test]
     async fn test_integration_like_usage() {
         // Test usage pattern similar to actual application
-        let shutdown_notify = listen_signals();
+        let shutdown_notify = listen_signals().unwrap();
 
         // Simulate main application components
         let watcher_notify = shutdown_notify.clone();

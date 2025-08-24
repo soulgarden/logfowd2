@@ -118,6 +118,8 @@ logfowd2 implements a robust 3-component asynchronous pipeline designed for high
 ## 🔧 Installation & Deployment
 
 ### Prerequisites
+- **Platform**: Linux/Unix only (uses `std::os::unix` APIs and Unix signals)
+- **Rust Toolchain**: 1.85+ (required for Rust 2024 edition support)
 - **Kubernetes**: 1.14+ with `/var/log/pods` access
 - **Elasticsearch**: 7.x+ or ZincSearch compatible target
 
@@ -156,7 +158,7 @@ make build
 docker run -d --name logfowd2 \
   -v /var/log/pods:/var/log/pods:ro \
   -v $(pwd)/config.json:/app/config.json:ro \
-  soulgarden/logfowd2:0.0.7
+  soulgarden/logfowd2:0.0.8
 ```
 
 #### Kubernetes DaemonSet (Manual)
@@ -173,7 +175,7 @@ spec:
     spec:
       containers:
       - name: logfowd2
-        image: soulgarden/logfowd2:0.0.7
+        image: soulgarden/logfowd2:0.0.8
         volumeMounts:
         - name: varlogpods
           mountPath: /var/log/pods
@@ -205,11 +207,27 @@ spec:
   "max_concurrent_file_readers": 10,
   
   "channels": {
-    "watcher_buffer_size": 1000,
-    "es_buffer_size": 400,
-    "backpressure_threshold": 0.8,
-    "backpressure_min_delay_ms": 2,
-    "backpressure_max_delay_ms": 50
+    "watcher_buffer_size": 300,
+    "es_buffer_size": 30,
+    "backpressure_threshold": 0.7,
+    "backpressure_min_delay_ms": 5,
+    "backpressure_max_delay_ms": 60,
+    "notify_buffer_warning_threshold": 1000,
+    "notify_buffer_max_size": 10000,
+    "notify_drop_on_overflow": true,
+    "notify_filesystem_buffer_warning_threshold": 1000,
+    "notify_filesystem_buffer_size": 1024
+  },
+  
+  "metrics": {
+    "enabled": false,
+    "port": 9090,
+    "path": "/metrics"
+  },
+  
+  "logging": {
+    "level": "info",
+    "format": "simple"
   },
   
   "es": {
@@ -217,26 +235,36 @@ spec:
     "port": 9200,
     "index_name": "logfowd",
     "flush_interval": 1000,
-    "bulk_size": 1000,
-    "workers": 2
+    "bulk_size": 300,
+    "workers": 1
   }
 }
 ```
 
 **Configuration Field Explanations:**
 - `max_concurrent_file_readers: 10` - Used by SmartTaskPool (2-10 dynamic range)
-- `watcher_buffer_size: 1000` - Events buffer from watcher (memory optimized)
-- `es_buffer_size: 400` - Events buffer to ES workers (memory optimized)  
-- `backpressure_threshold: 0.8` - Trigger backpressure at 80% buffer full
-- `backpressure_min_delay_ms: 2` - Minimum adaptive delay when backpressure is active
-- `backpressure_max_delay_ms: 50` - Maximum adaptive delay at full utilization
+- `watcher_buffer_size: 300` - Events buffer from watcher (memory optimized)
+- `es_buffer_size: 30` - Events buffer to ES workers (memory optimized)  
+- `backpressure_threshold: 0.7` - Trigger backpressure at 70% buffer full
+- `backpressure_min_delay_ms: 5` - Minimum adaptive delay when backpressure is active
+- `backpressure_max_delay_ms: 60` - Maximum adaptive delay at full utilization
+- `notify_buffer_warning_threshold: 1000` - Warning threshold for notify event buffer
+- `notify_buffer_max_size: 10000` - Maximum size of notify event buffer
+- `notify_drop_on_overflow: true` - Whether to drop events when notify buffer is full
+- `notify_filesystem_buffer_warning_threshold: 1000` - Warning threshold for filesystem event buffer
+- `notify_filesystem_buffer_size: 1024` - Size of filesystem event buffer
+- `metrics.enabled: false` - Enable/disable Prometheus metrics
+- `metrics.port: 9090` - Port for metrics endpoint
+- `metrics.path: "/metrics"` - Path for metrics endpoint
+- `logging.level: "info"` - Log level (debug/info/warn/error)
+- `logging.format: "simple"` - Log format (simple/structured)
 - `read_existing_on_startup: false|true` - If false, skip historical content and start from end (reduces startup memory spikes)
 - `read_chunk_size: 200` - Max lines per read batch; smaller values reduce peak memory
 - `max_line_size: 1048576` - Maximum bytes per log line (1MB default); prevents OOM from extremely long lines
 - `index_name: "logfowd"` - Creates daily indices: logfowd-2024.01.15
 - `flush_interval: 1000` - Batch timeout in milliseconds
-- `bulk_size: 1000` - Maximum events per batch
-- `workers: 2` - Parallel ES worker count (production optimized)
+- `bulk_size: 300` - Maximum events per batch
+- `workers: 1` - Parallel ES worker count
 
 ### Tuning Guide
 
@@ -268,91 +296,6 @@ Helm overrides example
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CFG_PATH` | `./config.json` | Path to configuration file |
-
-**Note**: Logging is currently hardcoded to Debug level with JSON format output.
-
-### Production Configuration Recommendations
-
-#### Balanced (128Mi) - Memory Safety Focus
-```json
-{
-  "channels": {
-    "watcher_buffer_size": 300,
-    "es_buffer_size": 60,
-    "backpressure_threshold": 0.8,
-    "backpressure_min_delay_ms": 5,
-    "backpressure_max_delay_ms": 60
-  },
-  "es": {
-    "flush_interval": 1000,
-    "bulk_size": 500,
-    "workers": 1
-  },
-  "max_concurrent_file_readers": 3,
-  "read_existing_on_startup": false,
-  "read_chunk_size": 100,
-  "max_line_size": 524288,
-  "is_debug": false
-}
-```
-
-#### High-Throughput Environment (Large Clusters)
-```json
-{
-  "channels": {
-    "watcher_buffer_size": 2000,
-    "es_buffer_size": 800,
-    "backpressure_threshold": 0.9,
-    "backpressure_min_delay_ms": 2,
-    "backpressure_max_delay_ms": 40
-  },
-  "es": {
-    "flush_interval": 500,
-    "bulk_size": 2000,
-    "workers": 4
-  },
-  "read_existing_on_startup": true,
-  "read_chunk_size": 400,
-  "max_line_size": 2097152,
-  "max_concurrent_file_readers": 20,
-  "is_debug": false
-}
-```
-
-**High-throughput notes:** 
-- SmartTaskPool max limit: 20 workers
-- Optimized for clusters with high log volume
-- `max_line_size: 2MB` - Handles larger log payloads (JSON dumps, stack traces)
-- Resource requirements: ~100Mi memory, 300m CPU
-
-#### Memory-Constrained Environment (<64Mi)
-```json
-{
-  "channels": {
-    "watcher_buffer_size": 500,
-    "es_buffer_size": 200,
-    "backpressure_threshold": 0.7,
-    "backpressure_min_delay_ms": 5,
-    "backpressure_max_delay_ms": 60
-  },
-  "es": {
-    "flush_interval": 2000,
-    "bulk_size": 500,
-    "workers": 1
-  },
-  "read_existing_on_startup": false,
-  "read_chunk_size": 200,
-  "max_line_size": 262144,
-  "max_concurrent_file_readers": 5,
-  "is_debug": false
-}
-```
-
-**Memory-constrained notes:**
-- SmartTaskPool ultra-low setting: max 5 workers
-- `max_line_size: 256KB` - Conservative limit to prevent OOM in tight environments
-- Optimized for minimal resource usage
-- Suitable for edge deployments and small clusters
 
 ### Prometheus Metrics (Optional)
 

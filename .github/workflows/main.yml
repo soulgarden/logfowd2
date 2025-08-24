@@ -42,6 +42,6 @@ jobs:
           context: .
           file: Dockerfile
           push: true
-          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:0.0.7
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:0.0.8
           cache-from: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:latest
           cache-to: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:latest,mode=max

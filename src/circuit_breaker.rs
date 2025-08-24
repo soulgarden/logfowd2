@@ -435,9 +435,9 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let cb = circuit_breaker.clone();
-            handles.push(tokio::spawn(async move {
-                cb.call(successful_operation).await
-            }));
+            handles.push(tokio::spawn(
+                async move { cb.call(successful_operation).await },
+            ));
         }
 
         // All should succeed
@@ -457,9 +457,9 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..5 {
             let cb = circuit_breaker.clone();
-            handles.push(tokio::spawn(async move {
-                cb.call(failing_operation).await
-            }));
+            handles.push(tokio::spawn(
+                async move { cb.call(failing_operation).await },
+            ));
         }
 
         // Wait for all to complete

@@ -1,5 +1,5 @@
 use prometheus::{
-    GaugeVec, HistogramVec, IntCounterVec, IntGaugeVec, Registry, TextEncoder, register_gauge_vec,
+    GaugeVec, HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder, register_gauge_vec,
     register_histogram_vec, register_int_counter_vec, register_int_gauge_vec,
 };
 use std::sync::OnceLock;
@@ -37,28 +37,37 @@ pub struct LogfwdMetrics {
     #[allow(dead_code)]
     pub files_tracked: IntGaugeVec,
 
-    // Internal registry
-    registry: Registry,
+    // Notify callback and EventBridge metrics
+    #[allow(dead_code)]
+    pub notify_events_dropped: IntCounterVec,
+    #[allow(dead_code)]
+    pub notify_bridge_queue_size: IntGaugeVec,
+    #[allow(dead_code)]
+    pub notify_callback_blocked_ms: HistogramVec,
+
+    // NotifyBridge filesystem event metrics
+    #[allow(dead_code)]
+    pub notify_filesystem_events_dropped: IntCounterVec,
+    #[allow(dead_code)]
+    pub notify_filesystem_events_forwarded: IntCounterVec,
+    #[allow(dead_code)]
+    pub notify_filesystem_queue_size: IntGaugeVec,
 }
 
 impl LogfwdMetrics {
     fn new() -> Result<Self, prometheus::Error> {
-        let registry = Registry::new();
-
         // Performance metrics
         let events_processed_total = register_int_counter_vec!(
             "logfowd_events_processed_total",
             "Total number of log events processed",
             &["component", "status"] // component: watcher|sender|es_worker, status: success|error
         )?;
-        registry.register(Box::new(events_processed_total.clone()))?;
 
         let events_per_second = register_gauge_vec!(
             "logfowd_events_per_second",
             "Current events processing rate per second",
             &["component"]
         )?;
-        registry.register(Box::new(events_per_second.clone()))?;
 
         let batch_size_histogram = register_histogram_vec!(
             "logfowd_batch_size",
@@ -66,7 +75,6 @@ impl LogfwdMetrics {
             &["component"], // sender|es_worker
             vec![1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]
         )?;
-        registry.register(Box::new(batch_size_histogram.clone()))?;
 
         let processing_duration_seconds = register_histogram_vec!(
             "logfowd_processing_duration_seconds",
@@ -74,7 +82,6 @@ impl LogfwdMetrics {
             &["component", "operation"], // operation: read_file|send_batch|es_index
             vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
         )?;
-        registry.register(Box::new(processing_duration_seconds.clone()))?;
 
         // System health metrics
         let queue_size = register_int_gauge_vec!(
@@ -82,28 +89,24 @@ impl LogfwdMetrics {
             "Current size of processing queues",
             &["component", "queue_type"] // component: watcher|sender|es_worker, queue_type: input|output|dlq
         )?;
-        registry.register(Box::new(queue_size.clone()))?;
 
         let backpressure_active = register_int_gauge_vec!(
             "logfowd_backpressure_active",
             "Whether backpressure is currently active (0=no, 1=yes)",
             &["component"]
         )?;
-        registry.register(Box::new(backpressure_active.clone()))?;
 
         let circuit_breaker_state = register_int_gauge_vec!(
             "logfowd_circuit_breaker_state",
             "Circuit breaker state (0=closed, 1=open, 2=half_open)",
             &["component", "breaker_name"]
         )?;
-        registry.register(Box::new(circuit_breaker_state.clone()))?;
 
         let workers_active = register_int_gauge_vec!(
             "logfowd_workers_active",
             "Number of active worker threads",
             &["component"]
         )?;
-        registry.register(Box::new(workers_active.clone()))?;
 
         // Error and monitoring metrics
         let errors_total = register_int_counter_vec!(
@@ -111,21 +114,57 @@ impl LogfwdMetrics {
             "Total number of errors by type and component",
             &["component", "error_type"] // error_type: file_read|network|parse|timeout
         )?;
-        registry.register(Box::new(errors_total.clone()))?;
 
         let dead_letter_queue_size = register_int_gauge_vec!(
             "logfowd_dead_letter_queue_size",
             "Current size of dead letter queue",
             &["queue_type"] // queue_type: events|retries
         )?;
-        registry.register(Box::new(dead_letter_queue_size.clone()))?;
 
         let files_tracked = register_int_gauge_vec!(
             "logfowd_files_tracked",
             "Number of files currently being tracked",
             &["namespace"] // kubernetes namespace for tracking
         )?;
-        registry.register(Box::new(files_tracked.clone()))?;
+
+        // Notify callback and EventBridge metrics
+        let notify_events_dropped = register_int_counter_vec!(
+            "logfowd_notify_events_dropped_total",
+            "Total number of events dropped in notify callback due to overflow",
+            &["reason"] // reason: queue_full|channel_closed
+        )?;
+
+        let notify_bridge_queue_size = register_int_gauge_vec!(
+            "logfowd_notify_bridge_queue_size",
+            "Current size of the notify event bridge queue",
+            &["queue_type"] // queue_type: notify_buffer|bridge_internal
+        )?;
+
+        let notify_callback_blocked_ms = register_histogram_vec!(
+            "logfowd_notify_callback_blocked_ms",
+            "Time in milliseconds the notify callback was blocked",
+            &["operation"], // operation: send|bridge_forward
+            vec![0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
+        )?;
+
+        // NotifyBridge filesystem event metrics
+        let notify_filesystem_events_dropped = register_int_counter_vec!(
+            "logfowd_notify_filesystem_events_dropped_total",
+            "Total number of filesystem events dropped by NotifyBridge",
+            &["reason"] // reason: bridge_bounded_channel_full|unbounded_channel_closed
+        )?;
+
+        let notify_filesystem_events_forwarded = register_int_counter_vec!(
+            "logfowd_notify_filesystem_events_forwarded_total",
+            "Total number of filesystem events successfully forwarded by NotifyBridge",
+            &["component", "status"] // component: notify_callback|notify_bridge, status: sent|forwarded
+        )?;
+
+        let notify_filesystem_queue_size = register_int_gauge_vec!(
+            "logfowd_notify_filesystem_queue_size",
+            "Current size of the NotifyBridge filesystem event queues",
+            &["component", "queue_type"] // component: notify_bridge, queue_type: unbounded_queue|bounded_queue
+        )?;
 
         Ok(LogfwdMetrics {
             events_processed_total,
@@ -139,13 +178,18 @@ impl LogfwdMetrics {
             errors_total,
             dead_letter_queue_size,
             files_tracked,
-            registry,
+            notify_events_dropped,
+            notify_bridge_queue_size,
+            notify_callback_blocked_ms,
+            notify_filesystem_events_dropped,
+            notify_filesystem_events_forwarded,
+            notify_filesystem_queue_size,
         })
     }
 
     pub fn gather(&self) -> String {
         let encoder = TextEncoder::new();
-        let metric_families = self.registry.gather();
+        let metric_families = prometheus::gather();
         encoder
             .encode_to_string(&metric_families)
             .unwrap_or_else(|e| format!("# Error encoding metrics: {}\n", e))

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -60,6 +60,10 @@ impl AppState {
                 );
                 return Ok(state);
             }
+            Err(StateError::ChecksumMismatch) => {
+                // Checksum mismatch should not fall back to backup - it's a data integrity issue
+                return Err(StateError::ChecksumMismatch);
+            }
             Err(e) => {
                 warn!("Failed to load main state file: {:?}", e);
             }
@@ -102,8 +106,9 @@ impl AppState {
             }
         }
 
-        // Update checksum to current format
-        state.checksum = Some(Self::calculate_checksum(&content));
+        // Update checksum to current format using deterministic calculation
+        let content_for_checksum = Self::create_content_without_checksum(&state)?;
+        state.checksum = Some(Self::calculate_checksum(&content_for_checksum));
         Ok(state)
     }
 
@@ -252,15 +257,42 @@ impl AppState {
     }
 
     fn create_content_without_checksum(state: &AppState) -> Result<String, StateError> {
-        let mut state_copy = state.clone();
-        state_copy.checksum = None;
-        serde_json::to_string_pretty(&state_copy).map_err(StateError::SerializationError)
+        // Create a deterministic representation by using sorted keys
+        let sorted_files: BTreeMap<String, &FileState> =
+            state.files.iter().map(|(k, v)| (k.clone(), v)).collect();
+
+        // Create a temporary structure for deterministic serialization
+        #[derive(Serialize)]
+        struct DeterministicAppState<'a> {
+            files: BTreeMap<String, &'a FileState>,
+            version: u32,
+            checksum: Option<String>,
+        }
+
+        let deterministic_state = DeterministicAppState {
+            files: sorted_files,
+            version: state.version,
+            checksum: None, // Always None for checksum calculation
+        };
+
+        serde_json::to_string_pretty(&deterministic_state).map_err(StateError::SerializationError)
     }
 
     fn calculate_checksum(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+
+    /// Create an efficient clone for save operations
+    pub fn clone_for_save(&self) -> Self {
+        self.clone()
+    }
+
+    /// Get a specific file state without holding a long-term lock
+    #[allow(dead_code)] // Available for future use
+    pub fn get_file_state_clone(&self, file_path: &str) -> Option<FileState> {
+        self.files.get(file_path).cloned()
     }
 }
 
@@ -394,5 +426,155 @@ mod tests {
         let loaded = AppState::load_from_file(&main_path).unwrap();
         // Expect new empty state
         assert!(loaded.files.is_empty());
+    }
+
+    #[test]
+    fn test_checksum_consistency_across_multiple_serializations() {
+        // Create a state with multiple files to increase chances of HashMap order variation
+        let mut state = AppState::new();
+        state.add_file(
+            "/var/log/pods/ns1_pod1_uid1/container1/0.log".to_string(),
+            1001,
+            500,
+            1000,
+        );
+        state.add_file(
+            "/var/log/pods/ns2_pod2_uid2/container2/0.log".to_string(),
+            1002,
+            600,
+            2000,
+        );
+        state.add_file(
+            "/var/log/pods/ns3_pod3_uid3/container3/0.log".to_string(),
+            1003,
+            700,
+            3000,
+        );
+        state.add_file(
+            "/var/log/pods/ns4_pod4_uid4/container4/0.log".to_string(),
+            1004,
+            800,
+            4000,
+        );
+        state.add_file(
+            "/var/log/pods/ns5_pod5_uid5/container5/0.log".to_string(),
+            1005,
+            900,
+            5000,
+        );
+
+        // Update positions to make data more complex
+        state.update_file_position(
+            "/var/log/pods/ns1_pod1_uid1/container1/0.log".to_string(),
+            100,
+        );
+        state.update_file_position(
+            "/var/log/pods/ns2_pod2_uid2/container2/0.log".to_string(),
+            200,
+        );
+        state.update_file_position(
+            "/var/log/pods/ns3_pod3_uid3/container3/0.log".to_string(),
+            300,
+        );
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap();
+
+        // Serialize and calculate checksum multiple times
+        let mut checksums = Vec::new();
+        for _ in 0..10 {
+            // Save and reload to force serialization/deserialization
+            state.save_to_file(path).unwrap();
+            let reloaded_state = AppState::load_from_file(path).unwrap();
+
+            // Extract the checksum
+            if let Some(checksum) = reloaded_state.checksum {
+                checksums.push(checksum);
+            }
+        }
+
+        // All checksums should be identical for the same data
+        assert!(!checksums.is_empty(), "No checksums were generated");
+        let first_checksum = &checksums[0];
+        for (i, checksum) in checksums.iter().enumerate() {
+            assert_eq!(
+                checksum, first_checksum,
+                "Checksum mismatch at iteration {}: expected '{}', got '{}'",
+                i, first_checksum, checksum
+            );
+        }
+    }
+
+    #[test]
+    fn test_checksum_calculation_deterministic() {
+        // Test that the same state produces the same checksum when serialized multiple times
+        let mut state = AppState::new();
+        state.add_file("/test/file1.log".to_string(), 1, 100, 1000);
+        state.add_file("/test/file2.log".to_string(), 2, 200, 2000);
+        state.add_file("/test/file3.log".to_string(), 3, 300, 3000);
+
+        // Calculate checksum multiple times
+        let content1 = AppState::create_content_without_checksum(&state).unwrap();
+        let content2 = AppState::create_content_without_checksum(&state).unwrap();
+        let content3 = AppState::create_content_without_checksum(&state).unwrap();
+
+        assert_eq!(content1, content2, "Content should be deterministic");
+        assert_eq!(content2, content3, "Content should be deterministic");
+
+        let checksum1 = AppState::calculate_checksum(&content1);
+        let checksum2 = AppState::calculate_checksum(&content2);
+        let checksum3 = AppState::calculate_checksum(&content3);
+
+        assert_eq!(checksum1, checksum2, "Checksums should be identical");
+        assert_eq!(checksum2, checksum3, "Checksums should be identical");
+    }
+
+    #[test]
+    fn test_checksum_verification_on_load() {
+        let mut state = AppState::new();
+        state.add_file("/test/file.log".to_string(), 12345, 1000, 1234567890);
+        state.update_file_position("/test/file.log".to_string(), 500);
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_str().unwrap();
+
+        // Save state with checksum
+        state.save_to_file(path).unwrap();
+
+        // Load and verify checksum passes
+        let loaded_state = AppState::load_from_file(path).unwrap();
+        assert_eq!(loaded_state.get_file_position("/test/file.log"), Some(500));
+        assert!(
+            loaded_state.checksum.is_some(),
+            "Checksum should be present"
+        );
+
+        // Read the original content for debugging
+        let original_content = std::fs::read_to_string(path).unwrap();
+        let original_parsed: serde_json::Value = serde_json::from_str(&original_content).unwrap();
+        let original_checksum = original_parsed["checksum"].as_str().unwrap();
+
+        // Manually corrupt the file by changing data but keeping the original checksum
+        let mut modified: serde_json::Value = serde_json::from_str(&original_content).unwrap();
+        if let Some(files) = modified["files"].as_object_mut() {
+            if let Some(file_state) = files.values_mut().next() {
+                if let Some(position) = file_state.get_mut("position") {
+                    *position = serde_json::Value::Number(serde_json::Number::from(999));
+                }
+            }
+        }
+        // Keep the original checksum - this should cause a mismatch
+        modified["checksum"] = serde_json::Value::String(original_checksum.to_string());
+
+        std::fs::write(path, serde_json::to_string_pretty(&modified).unwrap()).unwrap();
+
+        // Load should fail due to checksum mismatch
+        match AppState::load_from_file(path) {
+            Err(StateError::ChecksumMismatch) => {
+                // This is expected - checksum should detect the modification
+            }
+            Ok(_) => panic!("Expected checksum mismatch error"),
+            Err(e) => panic!("Unexpected error: {}", e),
+        }
     }
 }

@@ -38,8 +38,8 @@ docker_down dd:
 	docker-compose down
 
 build:
-	docker build . -t soulgarden/logfowd2:0.0.7 --platform linux/amd64
-	docker push soulgarden/logfowd2:0.0.7
+	docker build . -t soulgarden/logfowd2:0.0.8 --platform linux/amd64
+	docker push soulgarden/logfowd2:0.0.8
 
 #helm
 

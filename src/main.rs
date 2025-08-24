@@ -8,10 +8,10 @@ use std::sync::Arc;
 use json_env_logger2::builder;
 use json_env_logger2::env_logger::Target;
 use log::{LevelFilter, warn};
-use tokio::sync::RwLock;
 
 use crate::channels::create_bounded_channel;
 use crate::conf::Conf;
+use crate::error::{AppError, Result};
 use crate::es_worker_pool::EsWorkerPool;
 use crate::metrics_server::MetricsServer;
 use crate::sender::Sender;
@@ -22,7 +22,9 @@ mod channels;
 mod circuit_breaker;
 mod conf;
 mod dead_letter_queue;
+mod error;
 mod es_worker_pool;
+mod event_bridge;
 mod events;
 mod file_tracker;
 #[cfg(test)]
@@ -30,6 +32,7 @@ mod integration_tests;
 mod metadata_cache;
 mod metrics;
 mod metrics_server;
+mod notify_bridge;
 mod requests;
 mod retry;
 mod sender;
@@ -39,7 +42,7 @@ mod task_pool;
 mod watcher;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<()> {
     json_env_logger2::panic_hook();
 
     let mut builder = builder();
@@ -48,14 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder.filter_level(LevelFilter::Debug);
     builder.try_init().unwrap();
 
-    let conf = match Conf::new() {
-        Ok(conf) => conf,
-        Err(err) => {
-            warn!("failed to load configuration, {}", err);
-
-            std::process::exit(1);
-        }
-    };
+    let conf = Conf::new().map_err(|err| {
+        warn!("failed to load configuration, {}", err);
+        err
+    })?;
 
     // Initialize metrics system only if enabled
     let metrics_enabled = crate::metrics::are_metrics_enabled(&conf.metrics);
@@ -73,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log::set_max_level(LevelFilter::Info);
     }
 
-    let shutdown_notify = listen_signals();
+    let shutdown_notify: Arc<tokio::sync::Notify> = listen_signals()?;
 
     let watcher_shutdown_notify = shutdown_notify.clone();
     let sender_shutdown_notify = shutdown_notify.clone();
@@ -108,11 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let es_process_queue_sender = watcher_channel.sender();
     let es_process_queue_receiver = watcher_channel.receiver();
 
-    let sender = Arc::new(RwLock::new(Sender::new(
-        conf.clone(),
-        es_process_queue_receiver,
-        es_queue_sender,
-    )));
+    let sender = Sender::new(conf.clone(), es_process_queue_receiver, es_queue_sender);
 
     let mut watcher = Watcher::new(conf.clone(), es_process_queue_sender);
 
@@ -123,64 +118,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = if metrics_enabled {
         // Start all components including metrics server
         tokio::try_join!(
-            tokio::task::spawn(async move {
-                watcher.run(watcher_shutdown_notify).await?;
-                Ok::<(), notify::Error>(())
-            }),
-            tokio::task::spawn(async move {
-                sender.write().await.run(sender_shutdown_notify).await?;
-                Ok::<(), String>(())
-            }),
-            tokio::task::spawn(async move {
-                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
+            async move {
+                watcher
+                    .run(watcher_shutdown_notify)
                     .await
-                    .map_err(|e| format!("Failed to create ES worker pool: {}", e))?;
-                worker_pool.run(es_shutdown_notify).await?;
-                Ok::<(), String>(())
-            }),
-            tokio::task::spawn(async move {
+                    .map_err(AppError::from)
+            },
+            async move {
+                let mut sender = sender;
+                sender.run(sender_shutdown_notify).await
+            },
+            async move {
+                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver).await?;
+                worker_pool.run(es_shutdown_notify).await
+            },
+            async move {
                 metrics_server
                     .run(metrics_shutdown_notify)
                     .await
-                    .map_err(|e| format!("Metrics server error: {}", e))?;
-                Ok::<(), String>(())
-            }),
+                    .map_err(|e| AppError::ComponentStartup {
+                        component: format!("Metrics server: {}", e),
+                    })
+            },
         )
     } else {
         // Start components without metrics server
         log::info!("Metrics server disabled - starting core components only");
         tokio::try_join!(
-            tokio::task::spawn(async move {
-                watcher.run(watcher_shutdown_notify).await?;
-                Ok::<(), notify::Error>(())
-            }),
-            tokio::task::spawn(async move {
-                sender.write().await.run(sender_shutdown_notify).await?;
-                Ok::<(), String>(())
-            }),
-            tokio::task::spawn(async move {
-                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
+            async move {
+                watcher
+                    .run(watcher_shutdown_notify)
                     .await
-                    .map_err(|e| format!("Failed to create ES worker pool: {}", e))?;
-                worker_pool.run(es_shutdown_notify).await?;
-                Ok::<(), String>(())
-            }),
-            // Dummy task to maintain same tuple structure
-            tokio::task::spawn(async move {
+                    .map_err(AppError::from)
+            },
+            async move {
+                let mut sender = sender;
+                sender.run(sender_shutdown_notify).await
+            },
+            async move {
+                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver).await?;
+                worker_pool.run(es_shutdown_notify).await
+            },
+            // Dummy future to maintain same tuple structure
+            async move {
                 tokio::select! {
                     _ = metrics_shutdown_notify.notified() => {
                         log::info!("Dummy metrics task received shutdown signal");
                     }
                 }
-                Ok::<(), String>(())
-            }),
+                Ok::<(), AppError>(())
+            },
         )
     };
 
     match result {
-        Ok(_) => log::info!("shutdown completed"),
-        Err(e) => log::error!("thread join error {}", e),
+        Ok(_) => {
+            log::info!("shutdown completed");
+            Ok(())
+        }
+        Err(e) => {
+            log::error!("component failure: {}", e);
+            Err(e)
+        }
     }
-
-    Ok(())
 }
