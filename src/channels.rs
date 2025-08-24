@@ -15,13 +15,52 @@ pub struct BoundedChannel<T> {
 
 impl<T> BoundedChannel<T> {
     pub fn new(capacity: usize, backpressure_threshold: Option<f32>) -> Self {
-        let (sender, receiver) = async_channel::bounded(capacity);
+        // Ensure capacity is at least 1 to prevent division by zero and unintended rendezvous channels
+        let safe_capacity = if capacity == 0 {
+            warn!("Channel capacity cannot be 0, using minimum capacity of 1");
+            1
+        } else {
+            capacity
+        };
+
+        // Validate and clamp backpressure threshold to [0.0, 1.0] range
+        let safe_threshold = match backpressure_threshold {
+            Some(threshold) => {
+                if threshold.is_nan() {
+                    warn!("Backpressure threshold cannot be NaN, using default 0.8");
+                    0.8
+                } else if threshold.is_infinite() {
+                    warn!(
+                        "Backpressure threshold cannot be infinite ({}), using default 0.8",
+                        threshold
+                    );
+                    0.8
+                } else if threshold < 0.0 {
+                    warn!(
+                        "Backpressure threshold cannot be negative ({}), clamping to 0.0",
+                        threshold
+                    );
+                    0.0
+                } else if threshold > 1.0 {
+                    warn!(
+                        "Backpressure threshold cannot exceed 1.0 ({}), clamping to 1.0",
+                        threshold
+                    );
+                    1.0
+                } else {
+                    threshold
+                }
+            }
+            None => 0.8, // default
+        };
+
+        let (sender, receiver) = async_channel::bounded(safe_capacity);
 
         Self {
             sender,
             receiver,
-            capacity,
-            backpressure_threshold: backpressure_threshold.unwrap_or(0.8),
+            capacity: safe_capacity,
+            backpressure_threshold: safe_threshold,
             backpressure_log_interval: Duration::from_secs(5),
             backpressure_min_delay_ms: 2,
             backpressure_max_delay_ms: 50,
@@ -68,6 +107,12 @@ impl<T> BoundedChannel<T> {
             receiver: self.receiver.clone(),
         }
     }
+
+    /// Get the backpressure threshold for testing purposes
+    #[cfg(test)]
+    pub fn backpressure_threshold(&self) -> f32 {
+        self.backpressure_threshold
+    }
 }
 
 pub struct BoundedSender<T> {
@@ -98,12 +143,23 @@ impl<T> BoundedSender<T> {
     }
 
     pub fn is_under_backpressure(&self) -> bool {
+        // Special case: if threshold is 0.0, never trigger backpressure
+        // This prevents the bug where negative thresholds (clamped to 0.0) would
+        // always trigger backpressure
+        if self.backpressure_threshold <= 0.0 {
+            return false;
+        }
+
         let current_len = self.sender.len();
         let threshold = (self.capacity as f32 * self.backpressure_threshold) as usize;
         current_len >= threshold
     }
 
     pub fn utilization(&self) -> f32 {
+        if self.capacity == 0 {
+            // Safety check: if capacity is somehow 0, return 0.0 to prevent division by zero
+            return 0.0;
+        }
         self.sender.len() as f32 / self.capacity as f32
     }
 
@@ -228,7 +284,14 @@ pub fn create_bounded_channel<T>(
     backpressure_min_delay_ms: Option<u64>,
     backpressure_max_delay_ms: Option<u64>,
 ) -> BoundedChannel<T> {
-    let capacity = config_capacity.unwrap_or(default_capacity);
+    let mut capacity = config_capacity.unwrap_or(default_capacity);
+
+    // Ensure capacity is at least 1 to prevent division by zero and unintended rendezvous channels
+    if capacity == 0 {
+        warn!("Channel capacity cannot be 0, using minimum capacity of 1");
+        capacity = 1;
+    }
+
     debug!("Creating bounded channel with capacity: {}", capacity);
 
     BoundedChannel::new_with_params(
@@ -586,5 +649,149 @@ mod tests {
         // Test Debug formatting
         assert!(format!("{:?}", send_error).contains("Closed"));
         assert!(format!("{:?}", recv_error).contains("Closed"));
+    }
+
+    #[tokio::test]
+    async fn test_zero_capacity_handling() {
+        // Test BoundedChannel::new with zero capacity
+        let channel: BoundedChannel<i32> = BoundedChannel::new(0, Some(0.8));
+
+        // Should have been clamped to minimum capacity of 1
+        assert_eq!(channel.capacity, 1);
+
+        let mut sender = channel.sender();
+        let receiver = channel.receiver();
+
+        // Should work normally with capacity 1
+        sender.send(42).await.unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received, 42);
+
+        // Utilization should work without division by zero
+        assert_eq!(sender.utilization(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_create_bounded_channel_with_zero_config() {
+        // Test create_bounded_channel with zero capacity in config
+        let channel: BoundedChannel<String> =
+            create_bounded_channel(10, Some(0), Some(0.8), None, None);
+
+        // Should have been clamped to minimum capacity of 1
+        assert_eq!(channel.capacity, 1);
+
+        let mut sender = channel.sender();
+
+        // Should work normally
+        sender.send("test".to_string()).await.unwrap();
+        assert_eq!(sender.utilization(), 1.0); // Channel is full (1/1)
+        assert!(sender.is_under_backpressure()); // Should be above 80% threshold
+    }
+
+    #[tokio::test]
+    async fn test_negative_backpressure_threshold_validation() {
+        // Test that negative thresholds get clamped to 0.0
+        let channel: BoundedChannel<i32> = BoundedChannel::new(10, Some(-0.5));
+
+        // Should have been clamped to 0.0
+        assert_eq!(channel.backpressure_threshold(), 0.0);
+
+        let mut sender = channel.sender();
+
+        // With 0.0 threshold, backpressure should never trigger (threshold = 0)
+        for i in 0..10 {
+            sender.send(i).await.unwrap();
+        }
+        assert!(!sender.is_under_backpressure()); // Should not trigger backpressure even when full
+    }
+
+    #[tokio::test]
+    async fn test_excessive_backpressure_threshold_validation() {
+        // Test that values > 1.0 get clamped to 1.0
+        let channel: BoundedChannel<i32> = BoundedChannel::new(10, Some(1.5));
+
+        // Should have been clamped to 1.0
+        assert_eq!(channel.backpressure_threshold(), 1.0);
+
+        let mut sender = channel.sender();
+
+        // With 1.0 threshold, backpressure should only trigger when completely full
+        for i in 0..9 {
+            sender.send(i).await.unwrap();
+        }
+        assert!(!sender.is_under_backpressure()); // 9/10 = 90% < 100%
+
+        // Fill to capacity
+        sender.send(9).await.unwrap();
+        assert!(sender.is_under_backpressure()); // 10/10 = 100% >= 100%
+    }
+
+    #[tokio::test]
+    async fn test_nan_backpressure_threshold_validation() {
+        // Test that NaN values default to 0.8
+        let channel: BoundedChannel<i32> = BoundedChannel::new(10, Some(f32::NAN));
+
+        // Should have defaulted to 0.8
+        assert_eq!(channel.backpressure_threshold(), 0.8);
+    }
+
+    #[tokio::test]
+    async fn test_infinite_backpressure_threshold_validation() {
+        // Test that infinite values default to 0.8
+        let channel: BoundedChannel<i32> = BoundedChannel::new(10, Some(f32::INFINITY));
+
+        // Should have defaulted to 0.8
+        assert_eq!(channel.backpressure_threshold(), 0.8);
+
+        // Test negative infinity too
+        let channel2: BoundedChannel<i32> = BoundedChannel::new(10, Some(f32::NEG_INFINITY));
+        assert_eq!(channel2.backpressure_threshold(), 0.8);
+    }
+
+    #[tokio::test]
+    async fn test_edge_case_backpressure_values() {
+        // Test exactly 0.0
+        let channel1: BoundedChannel<i32> = BoundedChannel::new(10, Some(0.0));
+        assert_eq!(channel1.backpressure_threshold(), 0.0);
+
+        // Test exactly 1.0
+        let channel2: BoundedChannel<i32> = BoundedChannel::new(10, Some(1.0));
+        assert_eq!(channel2.backpressure_threshold(), 1.0);
+
+        // Test very small positive value
+        let channel3: BoundedChannel<i32> = BoundedChannel::new(10, Some(0.001));
+        assert_eq!(channel3.backpressure_threshold(), 0.001);
+
+        // Test very small negative value
+        let channel4: BoundedChannel<i32> = BoundedChannel::new(10, Some(-0.001));
+        assert_eq!(channel4.backpressure_threshold(), 0.0); // Should be clamped
+    }
+
+    #[tokio::test]
+    async fn test_negative_threshold_prevents_constant_backpressure() {
+        // This test verifies the fix for the original bug
+        // where negative thresholds would cause backpressure on every send
+
+        let channel: BoundedChannel<i32> = BoundedChannel::new(10, Some(-0.3));
+        let mut sender = channel.sender();
+
+        // With the fix, threshold should be clamped to 0.0
+        assert_eq!(channel.backpressure_threshold(), 0.0);
+
+        // Send one item - should not trigger backpressure with 0.0 threshold
+        sender.send(1).await.unwrap();
+        assert!(!sender.is_under_backpressure());
+
+        // Send more items - still should not trigger backpressure
+        for i in 2..=5 {
+            sender.send(i).await.unwrap();
+        }
+        assert!(!sender.is_under_backpressure());
+
+        // Even when full, 0.0 threshold means no backpressure
+        for i in 6..=10 {
+            sender.send(i).await.unwrap();
+        }
+        assert!(!sender.is_under_backpressure()); // This would have failed before the fix
     }
 }

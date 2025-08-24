@@ -546,122 +546,111 @@ impl FileTracker {
     }
 
     /// Read a single line with size limitation to prevent OOM from very long log lines
+    /// Optimized version using read_until to minimize syscalls
     async fn read_line_limited_static<R: AsyncBufReadExt + Unpin>(
         max_line_size: usize,
         path: &str,
         reader: &mut R,
         line: &mut String,
     ) -> Result<usize, std::io::Error> {
-        use tokio::io::AsyncReadExt;
+        // Pre-allocate buffer with reasonable capacity
+        let mut buffer = Vec::with_capacity(std::cmp::min(max_line_size + 16, 8192));
 
-        let mut temp_buffer = Vec::new();
-        let mut bytes_read = 0;
-        let mut byte_buffer = [0u8; 1];
-
-        while bytes_read < max_line_size {
-            match reader.read(&mut byte_buffer).await {
-                Ok(1) => {
-                    bytes_read += 1;
-                    let byte = byte_buffer[0];
-
-                    if byte == b'\n' {
-                        // Found newline, convert buffer to string and add newline
-                        let line_content = Self::sanitize_corrupted_content(&temp_buffer, path);
-                        line.push_str(&line_content);
-                        line.push('\n');
-                        return Ok(bytes_read);
-                    } else {
-                        temp_buffer.push(byte);
+        let bytes_read = match reader.read_until(b'\n', &mut buffer).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Handle read errors gracefully
+                match e.kind() {
+                    std::io::ErrorKind::InvalidData => {
+                        warn!("Invalid data encountered while reading {}: {}", path, e);
+                        line.push_str(" [READ_ERROR]");
+                        return Ok(0);
                     }
-                }
-                Ok(0) => {
-                    // EOF reached, convert buffer to string
-                    if !temp_buffer.is_empty() {
-                        let line_content = Self::sanitize_corrupted_content(&temp_buffer, path);
-                        line.push_str(&line_content);
+                    std::io::ErrorKind::UnexpectedEof => {
+                        warn!(
+                            "Unexpected EOF while reading {}, file may be truncated",
+                            path
+                        );
+                        // Try to process what we have in the buffer
+                        if !buffer.is_empty() {
+                            let line_content = Self::sanitize_corrupted_content(&buffer, path);
+                            line.push_str(&line_content);
+                        }
+                        return Ok(buffer.len());
                     }
-                    return Ok(bytes_read);
-                }
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "Unexpected read size",
-                    ));
-                }
-                Err(e) => {
-                    // Handle various types of read errors more gracefully
-                    match e.kind() {
-                        std::io::ErrorKind::InvalidData => {
-                            warn!("Invalid data encountered while reading {}: {}", path, e);
-                            // Try to recover by sanitizing what we have so far
-                            if !temp_buffer.is_empty() {
-                                let line_content =
-                                    Self::sanitize_corrupted_content(&temp_buffer, path);
-                                line.push_str(&line_content);
-                                line.push_str(" [READ_ERROR]");
-                            }
-                            return Ok(bytes_read);
-                        }
-                        std::io::ErrorKind::UnexpectedEof => {
-                            warn!(
-                                "Unexpected EOF while reading {}, file may be truncated",
-                                path
-                            );
-                            if !temp_buffer.is_empty() {
-                                let line_content =
-                                    Self::sanitize_corrupted_content(&temp_buffer, path);
-                                line.push_str(&line_content);
-                            }
-                            return Ok(bytes_read);
-                        }
-                        _ => {
-                            warn!("Read error in {}: {}", path, e);
-                            return Err(e);
-                        }
+                    _ => {
+                        warn!("Read error in {}: {}", path, e);
+                        return Err(e);
                     }
                 }
             }
+        };
+
+        if bytes_read == 0 {
+            return Ok(0); // EOF
         }
 
-        // Line exceeded max_line_size, find safe UTF-8 truncation point
-        // Try to find the last valid UTF-8 character boundary
-        let mut safe_end = temp_buffer.len();
-        while safe_end > 0 {
-            if std::str::from_utf8(&temp_buffer[..safe_end]).is_ok() {
-                break;
+        // Handle line size limiting
+        if buffer.len() > max_line_size {
+            // Truncate to max_line_size with UTF-8 safety
+            let mut safe_end = std::cmp::min(max_line_size, buffer.len());
+
+            // Find the last valid UTF-8 character boundary
+            while safe_end > 0 {
+                if std::str::from_utf8(&buffer[..safe_end]).is_ok() {
+                    break;
+                }
+                safe_end -= 1;
             }
-            safe_end -= 1;
-        }
 
-        // Convert valid portion to string
-        if safe_end > 0 {
-            let line_content = Self::sanitize_corrupted_content(&temp_buffer[..safe_end], path);
+            if safe_end > 0 {
+                let line_content = Self::sanitize_corrupted_content(&buffer[..safe_end], path);
+                line.push_str(&line_content);
+            }
+
+            warn!(
+                "Line exceeded max size {} bytes in file {}, truncating",
+                max_line_size, path
+            );
+            line.push_str("... [TRUNCATED]");
+
+            // If we didn't find a newline (line was truncated), we need to skip to the next newline
+            if buffer.last() != Some(&b'\n') {
+                Self::skip_to_newline(reader).await?;
+            } else {
+                // Add the newline that we found
+                line.push('\n');
+            }
+        } else {
+            // Line is within size limits, process normally
+            let line_content = Self::sanitize_corrupted_content(&buffer, path);
             line.push_str(&line_content);
         }
 
-        warn!(
-            "Line exceeded max size {} bytes in file {}, truncating",
-            max_line_size, path
-        );
-        line.push_str("... [TRUNCATED]");
+        Ok(bytes_read)
+    }
 
-        // Skip to next newline to avoid reading partial line next time
+    /// Skip reading until we find a newline character
+    async fn skip_to_newline<R: AsyncBufReadExt + Unpin>(
+        reader: &mut R,
+    ) -> Result<(), std::io::Error> {
+        use tokio::io::AsyncReadExt;
+
+        let mut byte_buffer = [0u8; 1];
         loop {
             match reader.read(&mut byte_buffer).await {
                 Ok(0) => break, // EOF
                 Ok(1) => {
                     if byte_buffer[0] == b'\n' {
-                        // Found newline, consume it and continue reading normally
-                        break;
+                        break; // Found newline, stop skipping
                     }
-                    // Continue skipping until we find newline
+                    // Continue skipping
                 }
                 Ok(_) => break,  // Unexpected read size
-                Err(_) => break, // Any error, just continue
+                Err(_) => break, // Any error, just stop
             }
         }
-
-        Ok(bytes_read)
+        Ok(())
     }
 
     /// Sanitize potentially corrupted content from log files

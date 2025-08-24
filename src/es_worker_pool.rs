@@ -13,6 +13,7 @@ use crate::Conf;
 use crate::channels::BoundedReceiver;
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerError, create_es_circuit_breaker};
 use crate::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
+use crate::error::{EsError, Result};
 use crate::events::Event;
 use crate::requests::{FieldsBody, Index};
 use crate::retry::{RetryConfig, RetryManager};
@@ -141,61 +142,15 @@ impl NetworkStats {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum EsError {
-    RequestFailed(String),
-    Timeout,
-    SerializationFailed(String),
-    ConnectionFailed(String),
-    DnsResolutionFailed(String),
-    TlsHandshakeFailed(String),
-    HttpStatusError { status: u16, body: String },
-    NetworkUnreachable(String),
-    RateLimited { retry_after: Option<Duration> },
-    ServiceUnavailable,
-}
-
-impl std::fmt::Display for EsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EsError::RequestFailed(msg) => write!(f, "ES request failed: {}", msg),
-            EsError::Timeout => write!(f, "ES request timed out"),
-            EsError::SerializationFailed(msg) => write!(f, "Serialization failed: {}", msg),
-            EsError::ConnectionFailed(msg) => write!(f, "Connection failed: {}", msg),
-            EsError::DnsResolutionFailed(msg) => write!(f, "DNS resolution failed: {}", msg),
-            EsError::TlsHandshakeFailed(msg) => write!(f, "TLS handshake failed: {}", msg),
-            EsError::HttpStatusError { status, body } => {
-                write!(
-                    f,
-                    "HTTP {} error: {}",
-                    status,
-                    if body.len() > 200 { &body[..200] } else { body }
-                )
-            }
-            EsError::NetworkUnreachable(msg) => write!(f, "Network unreachable: {}", msg),
-            EsError::RateLimited { retry_after } => {
-                if let Some(duration) = retry_after {
-                    write!(f, "Rate limited, retry after {}s", duration.as_secs())
-                } else {
-                    write!(f, "Rate limited")
-                }
-            }
-            EsError::ServiceUnavailable => write!(f, "Elasticsearch service unavailable"),
-        }
-    }
-}
-
-impl std::error::Error for EsError {}
-
 #[async_trait]
 pub trait HttpClient: Send + Sync {
-    async fn post_bytes(&self, url: &str, body: Vec<u8>) -> Result<String, EsError>;
+    async fn post_bytes(&self, url: &str, body: Vec<u8>) -> std::result::Result<String, EsError>;
     async fn post_bytes_with_timeout(
         &self,
         url: &str,
         body: Vec<u8>,
         timeout: Duration,
-    ) -> Result<(String, Duration), EsError>;
+    ) -> std::result::Result<(String, Duration), EsError>;
 }
 
 struct ReqwestHttpClient {
@@ -241,7 +196,7 @@ impl ReqwestHttpClient {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
-    async fn post_bytes(&self, url: &str, body: Vec<u8>) -> Result<String, EsError> {
+    async fn post_bytes(&self, url: &str, body: Vec<u8>) -> std::result::Result<String, EsError> {
         let (response, _latency) = self
             .post_bytes_with_timeout(url, body, Duration::from_secs(30))
             .await?;
@@ -253,7 +208,7 @@ impl HttpClient for ReqwestHttpClient {
         url: &str,
         body: Vec<u8>,
         timeout_duration: Duration,
-    ) -> Result<(String, Duration), EsError> {
+    ) -> std::result::Result<(String, Duration), EsError> {
         let start_time = std::time::Instant::now();
 
         // Send request with adaptive timeout
@@ -358,16 +313,23 @@ impl EsWorkerPool {
     pub async fn new(
         conf: Conf,
         es_queue_receiver: BoundedReceiver<Vec<Event>>,
-    ) -> Result<Self, EsError> {
+    ) -> std::result::Result<Self, EsError> {
         let worker_count = conf.es.workers as usize;
+
+        // Validate that at least one worker is configured
+        if worker_count == 0 {
+            return Err(EsError::RequestFailed(
+                "Cannot create ES worker pool with 0 workers. This would cause deadlock as no receivers would be available for the work distribution channel.".to_string()
+            ));
+        }
+
         let mut workers = Vec::with_capacity(worker_count);
 
         // Create shared dead letter queue
         let dlq_config = DeadLetterQueueConfig::default();
         let dead_letter_queue = Arc::new(DeadLetterQueue::new(dlq_config));
 
-        // Start background tasks for DLQ
-        dead_letter_queue.start_background_tasks().await;
+        // Note: DLQ background tasks will be started in run() method with shutdown_notify
 
         // Try to load existing dead letters from disk
         if let Err(e) = dead_letter_queue.load_from_disk().await {
@@ -388,15 +350,20 @@ impl EsWorkerPool {
         })
     }
 
-    pub async fn run(&mut self, shutdown_notify: Arc<Notify>) -> Result<(), String> {
-        info!(
-            "Starting ES worker pool with {} workers",
-            self.workers.len()
-        );
+    pub async fn run(&mut self, shutdown_notify: Arc<Notify>) -> Result<()> {
+        let worker_count = self.workers.len(); // Capture worker count before draining
+
+        // Start DLQ background tasks with shutdown coordination
+        let _dlq_handle = self
+            .dead_letter_queue
+            .start_background_tasks(shutdown_notify.clone())
+            .await;
+
+        info!("Starting ES worker pool with {} workers", worker_count);
 
         // Create work distribution channel with bounded capacity to prevent memory spikes
         // Capacity = workers * 2 to allow some queueing without excessive buffering
-        let channel_capacity = (self.workers.len() * 2).max(4); // Minimum 4, 2x workers
+        let channel_capacity = (worker_count * 2).max(4); // Minimum 4, 2x workers
         let (work_sender, work_receiver) = async_channel::bounded::<Vec<Event>>(channel_capacity);
 
         // Start all workers
@@ -418,7 +385,6 @@ impl EsWorkerPool {
             let work_sender = work_sender.clone();
             let es_queue_receiver = self.es_queue_receiver.clone();
             let shutdown_notify_clone = shutdown_notify.clone();
-            let worker_count = self.workers.len(); // Capture for use in async block
 
             tokio::spawn(async move {
                 loop {
@@ -489,7 +455,7 @@ impl EsWorker {
         id: usize,
         conf: Conf,
         dead_letter_queue: Arc<DeadLetterQueue>,
-    ) -> Result<Self, EsError> {
+    ) -> std::result::Result<Self, EsError> {
         // Create HTTP client with connection pooling
         let client = Client::builder()
             .pool_max_idle_per_host(10)
@@ -554,7 +520,7 @@ impl EsWorker {
         &mut self,
         work_receiver: async_channel::Receiver<Vec<Event>>,
         shutdown_notify: Arc<Notify>,
-    ) -> Result<(), String> {
+    ) -> Result<()> {
         info!("ES Worker {} starting", self.id);
 
         loop {
@@ -584,7 +550,7 @@ impl EsWorker {
         Ok(())
     }
 
-    async fn process_events(&mut self, events: Vec<Event>) -> Result<(), EsError> {
+    async fn process_events(&mut self, events: Vec<Event>) -> std::result::Result<(), EsError> {
         let event_count = events.len();
         debug!("Worker {} processing {} events", self.id, event_count);
 
@@ -726,7 +692,7 @@ impl EsWorker {
         }
     }
 
-    fn make_body(&self, events: Vec<Event>) -> Result<Vec<u8>, EsError> {
+    fn make_body(&self, events: Vec<Event>) -> std::result::Result<Vec<u8>, EsError> {
         let mut body: Vec<u8> = Vec::new();
 
         for event in events {
@@ -802,7 +768,11 @@ mod tests {
     struct NoopClient;
     #[async_trait]
     impl HttpClient for NoopClient {
-        async fn post_bytes(&self, _url: &str, _body: Vec<u8>) -> Result<String, EsError> {
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<String, EsError> {
             Ok("ok".to_string())
         }
 
@@ -811,7 +781,7 @@ mod tests {
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
-        ) -> Result<(String, Duration), EsError> {
+        ) -> std::result::Result<(String, Duration), EsError> {
             Ok(("ok".to_string(), Duration::from_millis(50)))
         }
     }
@@ -839,7 +809,11 @@ mod tests {
     struct FailingClient;
     #[async_trait]
     impl HttpClient for FailingClient {
-        async fn post_bytes(&self, _url: &str, _body: Vec<u8>) -> Result<String, EsError> {
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<String, EsError> {
             Err(EsError::RequestFailed("boom".to_string()))
         }
 
@@ -848,7 +822,7 @@ mod tests {
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
-        ) -> Result<(String, Duration), EsError> {
+        ) -> std::result::Result<(String, Duration), EsError> {
             Err(EsError::RequestFailed("boom".to_string()))
         }
     }
@@ -912,6 +886,11 @@ mod tests {
                 backpressure_threshold: Some(0.8),
                 backpressure_min_delay_ms: None,
                 backpressure_max_delay_ms: None,
+                notify_buffer_warning_threshold: None,
+                notify_buffer_max_size: None,
+                notify_drop_on_overflow: None,
+                notify_filesystem_buffer_warning_threshold: None,
+                notify_filesystem_buffer_size: None,
             }),
             metrics: None,
             logging: None,
@@ -930,7 +909,11 @@ mod tests {
     struct TimeoutClient;
     #[async_trait]
     impl HttpClient for TimeoutClient {
-        async fn post_bytes(&self, _url: &str, _body: Vec<u8>) -> Result<String, EsError> {
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<String, EsError> {
             Err(EsError::Timeout)
         }
 
@@ -939,7 +922,7 @@ mod tests {
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
-        ) -> Result<(String, Duration), EsError> {
+        ) -> std::result::Result<(String, Duration), EsError> {
             Err(EsError::Timeout)
         }
     }
@@ -947,7 +930,11 @@ mod tests {
     struct DnsFailureClient;
     #[async_trait]
     impl HttpClient for DnsFailureClient {
-        async fn post_bytes(&self, _url: &str, _body: Vec<u8>) -> Result<String, EsError> {
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<String, EsError> {
             Err(EsError::DnsResolutionFailed(
                 "elasticsearch.example.com: dns lookup failed".to_string(),
             ))
@@ -958,7 +945,7 @@ mod tests {
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
-        ) -> Result<(String, Duration), EsError> {
+        ) -> std::result::Result<(String, Duration), EsError> {
             Err(EsError::DnsResolutionFailed(
                 "elasticsearch.example.com: dns lookup failed".to_string(),
             ))
@@ -968,7 +955,11 @@ mod tests {
     struct RateLimitedClient;
     #[async_trait]
     impl HttpClient for RateLimitedClient {
-        async fn post_bytes(&self, _url: &str, _body: Vec<u8>) -> Result<String, EsError> {
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<String, EsError> {
             Err(EsError::RateLimited {
                 retry_after: Some(Duration::from_secs(10)),
             })
@@ -979,7 +970,7 @@ mod tests {
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
-        ) -> Result<(String, Duration), EsError> {
+        ) -> std::result::Result<(String, Duration), EsError> {
             Err(EsError::RateLimited {
                 retry_after: Some(Duration::from_secs(10)),
             })
@@ -989,7 +980,11 @@ mod tests {
     struct SlowClient;
     #[async_trait]
     impl HttpClient for SlowClient {
-        async fn post_bytes(&self, _url: &str, _body: Vec<u8>) -> Result<String, EsError> {
+        async fn post_bytes(
+            &self,
+            _url: &str,
+            _body: Vec<u8>,
+        ) -> std::result::Result<String, EsError> {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Ok("slow response".to_string())
         }
@@ -999,7 +994,7 @@ mod tests {
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
-        ) -> Result<(String, Duration), EsError> {
+        ) -> std::result::Result<(String, Duration), EsError> {
             tokio::time::sleep(Duration::from_millis(100)).await;
             Ok(("slow response".to_string(), Duration::from_millis(100)))
         }
@@ -1195,5 +1190,75 @@ mod tests {
         );
         assert!(worker.network_stats.success_count > 0);
         assert!(worker.network_stats.last_success.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_es_worker_pool_zero_workers_validation() {
+        use crate::channels::create_bounded_channel;
+
+        // Create a test config with 0 workers
+        let mut conf = create_test_config();
+        conf.es.workers = 0;
+
+        // Create a dummy channel for the test
+        let es_queue_channel = create_bounded_channel(10, None, None, None, None);
+        let es_queue_receiver = es_queue_channel.receiver();
+
+        // Attempt to create the worker pool - should fail
+        let result = EsWorkerPool::new(conf, es_queue_receiver).await;
+
+        assert!(
+            result.is_err(),
+            "Expected EsWorkerPool::new to fail with 0 workers"
+        );
+
+        let error = result.err().unwrap();
+        match error {
+            EsError::RequestFailed(msg) => {
+                assert!(msg.contains("Cannot create ES worker pool with 0 workers"));
+                assert!(msg.contains("would cause deadlock"));
+            }
+            _ => panic!("Expected RequestFailed error, got: {:?}", error),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_es_worker_pool_valid_workers() {
+        use crate::channels::create_bounded_channel;
+
+        // Create a test config with 1 worker
+        let conf = create_test_config();
+        assert!(
+            conf.es.workers > 0,
+            "Test config should have at least 1 worker"
+        );
+
+        // Create a dummy channel for the test
+        let es_queue_channel = create_bounded_channel(10, None, None, None, None);
+        let es_queue_receiver = es_queue_channel.receiver();
+
+        // Attempt to create the worker pool - should succeed
+        let result = EsWorkerPool::new(conf, es_queue_receiver).await;
+
+        assert!(
+            result.is_ok(),
+            "Expected EsWorkerPool::new to succeed with valid worker count"
+        );
+    }
+
+    #[test]
+    fn test_planned_worker_count_zero() {
+        let mut conf = create_test_config();
+        conf.es.workers = 0;
+
+        // The planned_worker_count function should return 0
+        assert_eq!(planned_worker_count(&conf), 0);
+
+        // But this configuration should fail validation when used
+        let validation_result = conf.validate();
+        assert!(
+            validation_result.is_err(),
+            "Config with 0 workers should fail validation"
+        );
     }
 }

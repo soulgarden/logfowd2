@@ -6,24 +6,6 @@
 
 Logfowd2 is a memory-efficient log forwarding daemon designed for Kubernetes environments. It monitors pod logs using filesystem events and streams them to Elasticsearch with advanced reliability features including circuit breakers, dead letter queues, and automatic backpressure control.
 
-## ⚡ Recent Architectural Improvements
-
-### Data Integrity & Correctness
-- **FIFO Event Ordering** - Fixed sender to preserve correct temporal sequence of log events
-- **Historical Log Recovery** - No data loss on startup - reads all existing log content  
-- **File Rotation Handling** - Robust support for Kubernetes log file rotation scenarios
-
-### Performance Optimizations  
-- **SmartTaskPool Architecture** - Dynamic worker scaling (2-10 workers) with 30s idle timeout
-- **Memory Baseline Reduction** - 90% reduction: from ~128Mi to 30-50Mi baseline usage
-- **CPU Efficiency** - Eliminated 100ms polling cycles for pure event-driven architecture
-- **Optimized Lock Management** - Reduced critical sections for better concurrency under load
-
-### Production Readiness
-- **Kubernetes Resource Limits** - Optimized to run within 150m CPU / 128Mi memory limits
-- **Channel Buffer Optimization** - 78% memory reduction with smart buffer sizing
-- **Debug Mode Control** - Production deployments use non-verbose logging by default
-
 ## 🚀 Key Features
 
 ### Production-Ready Reliability
@@ -31,43 +13,62 @@ Logfowd2 is a memory-efficient log forwarding daemon designed for Kubernetes env
 - **Dead Letter Queue** - Failed events persisted to disk with retry mechanism  
 - **Atomic State Management** - Crash-safe state persistence with checksums
 - **Graceful Shutdown** - Attempts to process remaining events before termination
-- **Error Recovery** - Comprehensive error handling with persistent event storage
+- **Advanced Network Resilience** - Adaptive timeouts (30s-120s), network failure classification, automatic degradation detection
 
 ### Performance & Scalability
 - **Smart Dynamic TaskPool** - On-demand worker scaling with automatic idle timeout
+- **NotifyBridge Architecture** - Two-tier channel system preventing filesystem callback blocking
 - **Bounded Channels** - Memory-safe queuing with automatic backpressure control
 - **Pure Event-Driven Architecture** - No polling, responds only to filesystem events
 - **Memory Bounded Operation** - Constant memory usage regardless of log volume
 - **FIFO Event Ordering** - Preserves correct temporal sequence of log events
 
-### Advanced File Handling
+### Advanced System Optimization
+- **MetadataCache System** - High-performance file metadata caching with TTL-based eviction (100ms TTL, LRU)
+- **Intelligent Retry Management** - Universal exponential backoff retry mechanism for all async operations
+- **Lock Optimization** - Drop/reacquire pattern minimizes lock contention and improves concurrency
 - **Event-Driven File Monitoring** - Uses filesystem events for instant rotation detection
 - **Historical Log Recovery** - Reads existing log content on startup (no data loss)
 - **Symlink Support** - Full support for Kubernetes symlinked log files
-- **Optimized Lock Management** - Minimal critical sections for better concurrency
 
 ## 🏗️ Architecture
 
-logfowd2 implements a robust 3-component asynchronous pipeline designed for high throughput and fault tolerance:
+logfowd2 implements a robust 4-component asynchronous pipeline designed for high throughput and fault tolerance:
 
 ```
-┌─────────────────┐    bounded     ┌─────────────────┐    bounded     ┌─────────────────────┐
-│                 │    channels    │                 │    channels    │                     │
-│     Watcher     ├───────────────►│     Sender      ├───────────────►│   ES Worker Pool    │
-│                 │  (backpressure)│                 │  (backpressure)│                     │
-└─────────────────┘                └─────────────────┘                └─────────────────────┘
+Filesystem Events
+        │
+        ▼
+┌─────────────────┐   unbounded     ┌─────────────────┐   bounded      ┌─────────────────────┐
+│                 │   to bounded    │                 │   channels     │                     │
+│  NotifyBridge   ├────────────────►│     Watcher     ├───────────────►│   ES Worker Pool    │
+│                 │    channels     │                 │ (backpressure) │                     │
+└─────────────────┘                 └─────────────────┘                └─────────────────────┘
         │                                   │                                   │
         ▼                                   ▼                                   ▼
-   FileTracker                         Batch Buffer                    Circuit Breaker
-   State Persist                       Timer/Size                     Dead Letter Queue
-   Symlink Support                     Flush Logic                    Connection Pool
+Two-Tier Channel                      FileTracker                      Circuit Breaker
+Drop-on-Overflow                      MetadataCache                    Dead Letter Queue
+Buffer Management                     State Persist                    RetryManager
+                                           │                           NetworkStats
+                                           ▼                           Connection Pool
+                                    ┌─────────────────┐
+                                    │                 │
+                                    │     Sender      │
+                                    │                 │
+                                    └─────────────────┘
+                                           │
+                                           ▼
+                                    Batch Buffer
+                                    Timer/Size
+                                    Flush Logic
 ```
 
 ### Component Details
 
 #### Watcher (`src/watcher.rs`)
 - **Purpose**: Monitors `/var/log/pods` recursively using filesystem events
-- **File Tracking**: Advanced FileTracker with symlink and rapid rotation support
+- **NotifyBridge Integration**: Uses NotifyBridge to prevent filesystem notify callback blocking
+- **File Tracking**: Advanced FileTracker with symlink and rapid rotation support, leveraging MetadataCache
 - **Metadata Parsing**: Extracts Kubernetes metadata (namespace, pod, container) from log paths
 - **Initial Sync**: Processes existing files on startup with position restoration
 - **Output**: Streams parsed events to Sender via bounded channels
@@ -81,19 +82,44 @@ logfowd2 implements a robust 3-component asynchronous pipeline designed for high
 - **Output**: Forwards batched events to ES Worker Pool
 
 #### ES Worker Pool (`src/es_worker_pool.rs`)
-- **Purpose**: Parallel Elasticsearch workers with fault tolerance
-- **Scalability**: Configurable worker pool size for horizontal scaling
-- **Circuit Breaker**: Fast-fail protection (10 failures → 30s timeout)
-- **Connection Pooling**: Reuses HTTP connections with 30s timeouts
+- **Purpose**: Parallel Elasticsearch workers with advanced fault tolerance
+- **Network Resilience**: Adaptive timeouts (30s-120s) based on measured network latency
+- **Circuit Breaker**: Fast-fail protection (10 failures → 30s timeout) with network awareness
+- **Connection Pooling**: Reuses HTTP connections with adaptive timeout adjustment
+- **Failure Classification**: Detailed network error types (DNS, TLS, Connection, Rate Limiting)
+- **NetworkStats Monitoring**: Exponential moving average for latency tracking with degradation detection
 - **Index Management**: Creates daily indices (`{index_name}-YYYY.MM.DD`)
-- **Error Handling**: Failed events routed to Dead Letter Queue
+- **Error Handling**: Failed events routed to Dead Letter Queue with RetryManager integration
+
+#### NotifyBridge (`src/notify_bridge.rs`)
+- **Purpose**: Two-tier channel architecture preventing filesystem notify callback deadlocks
+- **Architecture**: Filesystem events → unbounded channel → bounded channel → Watcher
+- **Buffer Management**: Configurable buffer sizes with warning thresholds
+- **Overflow Protection**: Configurable drop-on-overflow behavior to prevent memory exhaustion
+
+#### MetadataCache (`src/metadata_cache.rs`)
+- **Purpose**: High-performance file metadata caching with configurable TTL (100ms default)
+- **Performance**: Reduces filesystem syscalls for improved performance
+- **Eviction Strategy**: LRU eviction with capacity management (1000 entries default)
+- **Statistics**: Cache statistics tracking (hits, misses, hit rate) for optimization
+- **Thread Safety**: Thread-safe metadata operations with automatic expiration
+
+#### RetryManager (`src/retry.rs`)
+- **Purpose**: Universal exponential backoff retry mechanism for resilient operations
+- **Configuration**: Configurable retry parameters (max retries: 3, initial delay: 100ms, max delay: 10s)
+- **Adaptive Behavior**: Exponential delay calculation with customizable backoff multiplier (2.0 default)
+- **Generic Support**: Works with any async operation returning `Result<T, E>`
+- **Error Preservation**: Final error from last attempt is preserved and returned
 
 ### Communication & Flow Control
 
-- **Bounded Channels**: Configurable capacity prevents memory exhaustion
-- **Backpressure Mechanism**: Automatic throttling when downstream is overloaded
-- **Circuit Breaker Integration**: Protects against Elasticsearch cascade failures
-- **Atomic Operations**: State changes are crash-safe and consistent
+- **NotifyBridge Integration**: Critical two-tier channel architecture prevents filesystem notify callback deadlocks
+- **Bounded Channels**: Configurable capacity prevents memory exhaustion with intelligent buffer sizing
+- **Backpressure Mechanism**: Automatic throttling when downstream is overloaded with adaptive delay scaling
+- **Circuit Breaker Integration**: Network-aware protection against Elasticsearch cascade failures
+- **RetryManager Coordination**: Universal retry mechanism ensures reliable event delivery across all components
+- **MetadataCache Optimization**: Shared metadata caching reduces filesystem pressure across the pipeline
+- **Atomic Operations**: State changes are crash-safe and consistent with optimized lock patterns
 
 ## ⚡ Performance Characteristics
 
@@ -101,23 +127,33 @@ logfowd2 implements a robust 3-component asynchronous pipeline designed for high
 - **Parallel ES Workers**: Concurrent bulk operations with configurable pool sizing
 - **Adaptive Batching**: Size and time-based flushing with backpressure awareness
 - **Memory Streaming**: Bounded buffer architecture prevents memory growth
+- **Advanced Lock Optimization**: Drop/reacquire pattern minimizes lock contention during I/O operations
 
 ### Resource Efficiency  
 - **Ultra-Low Memory Baseline**: 30-50Mi baseline with SmartTaskPool (90% reduction)
 - **CPU Efficient**: Pure event-driven architecture eliminates polling overhead
 - **Dynamic Worker Scaling**: 2-10 workers on-demand with 30s idle timeout
 - **Optimized Channel Buffers**: 78% memory reduction with smart sizing
-- **Smart Retry Logic**: Exponential backoff (500ms → 30s) reduces CPU waste
+- **Metadata Caching**: TTL-based filesystem metadata caching reduces syscalls by order of magnitude
+
+### Network & System Resilience
+- **Adaptive Network Behavior**: Dynamic timeout adjustment (30s-120s) based on measured latency
+- **Network Failure Intelligence**: Detailed error classification (DNS, TLS, Connection, Rate Limiting)
+- **NetworkStats Monitoring**: Exponential moving average latency tracking with degradation detection
+- **Universal Retry Logic**: Exponential backoff (100ms → 10s) with configurable parameters for all async operations
+- **NotifyBridge Protection**: Two-tier channel system prevents filesystem callback deadlocks
 
 ### Reliability Features
 - **State Persistence**: Application state saved every 10 seconds with integrity checks
 - **Crash Recovery**: Resumes from exact file positions after unexpected shutdowns
 - **Data Integrity**: Checksums and atomic writes ensure state consistency
-- **Structured Logging**: JSON logs for observability and debugging
+- **Lock Contention Minimization**: Clone-then-save pattern and scoped locking for maximum concurrency
 
 ## 🔧 Installation & Deployment
 
 ### Prerequisites
+- **Platform**: Linux/Unix only (uses `std::os::unix` APIs and Unix signals)
+- **Rust Toolchain**: 1.85+ (required for Rust 2024 edition support)
 - **Kubernetes**: 1.14+ with `/var/log/pods` access
 - **Elasticsearch**: 7.x+ or ZincSearch compatible target
 
@@ -156,7 +192,7 @@ make build
 docker run -d --name logfowd2 \
   -v /var/log/pods:/var/log/pods:ro \
   -v $(pwd)/config.json:/app/config.json:ro \
-  soulgarden/logfowd2:0.0.7
+  soulgarden/logfowd2:0.0.8
 ```
 
 #### Kubernetes DaemonSet (Manual)
@@ -173,7 +209,7 @@ spec:
     spec:
       containers:
       - name: logfowd2
-        image: soulgarden/logfowd2:0.0.7
+        image: soulgarden/logfowd2:0.0.8
         volumeMounts:
         - name: varlogpods
           mountPath: /var/log/pods
@@ -205,11 +241,27 @@ spec:
   "max_concurrent_file_readers": 10,
   
   "channels": {
-    "watcher_buffer_size": 1000,
-    "es_buffer_size": 400,
-    "backpressure_threshold": 0.8,
-    "backpressure_min_delay_ms": 2,
-    "backpressure_max_delay_ms": 50
+    "watcher_buffer_size": 300,
+    "es_buffer_size": 30,
+    "backpressure_threshold": 0.7,
+    "backpressure_min_delay_ms": 5,
+    "backpressure_max_delay_ms": 60,
+    "notify_buffer_warning_threshold": 1000,
+    "notify_buffer_max_size": 10000,
+    "notify_drop_on_overflow": true,
+    "notify_filesystem_buffer_warning_threshold": 1000,
+    "notify_filesystem_buffer_size": 1024
+  },
+  
+  "metrics": {
+    "enabled": false,
+    "port": 9090,
+    "path": "/metrics"
+  },
+  
+  "logging": {
+    "level": "info",
+    "format": "simple"
   },
   
   "es": {
@@ -217,26 +269,36 @@ spec:
     "port": 9200,
     "index_name": "logfowd",
     "flush_interval": 1000,
-    "bulk_size": 1000,
-    "workers": 2
+    "bulk_size": 300,
+    "workers": 1
   }
 }
 ```
 
 **Configuration Field Explanations:**
 - `max_concurrent_file_readers: 10` - Used by SmartTaskPool (2-10 dynamic range)
-- `watcher_buffer_size: 1000` - Events buffer from watcher (memory optimized)
-- `es_buffer_size: 400` - Events buffer to ES workers (memory optimized)  
-- `backpressure_threshold: 0.8` - Trigger backpressure at 80% buffer full
-- `backpressure_min_delay_ms: 2` - Minimum adaptive delay when backpressure is active
-- `backpressure_max_delay_ms: 50` - Maximum adaptive delay at full utilization
+- `watcher_buffer_size: 300` - Events buffer from watcher (memory optimized)
+- `es_buffer_size: 30` - Events buffer to ES workers (memory optimized)  
+- `backpressure_threshold: 0.7` - Trigger backpressure at 70% buffer full
+- `backpressure_min_delay_ms: 5` - Minimum adaptive delay when backpressure is active
+- `backpressure_max_delay_ms: 60` - Maximum adaptive delay at full utilization
+- `notify_buffer_warning_threshold: 1000` - Warning threshold for notify event buffer
+- `notify_buffer_max_size: 10000` - Maximum size of notify event buffer
+- `notify_drop_on_overflow: true` - Whether to drop events when notify buffer is full
+- `notify_filesystem_buffer_warning_threshold: 1000` - Warning threshold for filesystem event buffer
+- `notify_filesystem_buffer_size: 1024` - Size of filesystem event buffer
+- `metrics.enabled: false` - Enable/disable Prometheus metrics
+- `metrics.port: 9090` - Port for metrics endpoint
+- `metrics.path: "/metrics"` - Path for metrics endpoint
+- `logging.level: "info"` - Log level (debug/info/warn/error)
+- `logging.format: "simple"` - Log format (simple/structured)
 - `read_existing_on_startup: false|true` - If false, skip historical content and start from end (reduces startup memory spikes)
 - `read_chunk_size: 200` - Max lines per read batch; smaller values reduce peak memory
 - `max_line_size: 1048576` - Maximum bytes per log line (1MB default); prevents OOM from extremely long lines
 - `index_name: "logfowd"` - Creates daily indices: logfowd-2024.01.15
 - `flush_interval: 1000` - Batch timeout in milliseconds
-- `bulk_size: 1000` - Maximum events per batch
-- `workers: 2` - Parallel ES worker count (production optimized)
+- `bulk_size: 300` - Maximum events per batch
+- `workers: 1` - Parallel ES worker count
 
 ### Tuning Guide
 
@@ -253,106 +315,23 @@ Symptoms → Actions
 - "Channel backpressure detected": lower producers (readers/chunk), raise consumers (flush/bulk/workers), or increase buffer.
 - "ES worker pool backpressured": focus on ES throughput (scale ES, tweak bulk size/flush, index settings).
 
-Helm overrides example
-`helm upgrade -n logging logfowd helm/logfowd2 \
+Helm overrides example:
+```bash
+helm upgrade -n logging logfowd helm/logfowd2 \
   --set app.elasticsearch.flush_interval=1000 \
   --set app.elasticsearch.bulk_size=500 \
   --set app.max_concurrent_file_readers=3 \
   --set app.read_chunk_size=100 \
   --set app.max_line_size=524288 \
   --set app.channels.es_buffer_size=60 \
-  --set app.channels.backpressure_threshold=0.8`
+  --set app.channels.backpressure_threshold=0.8
+```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CFG_PATH` | `./config.json` | Path to configuration file |
-
-**Note**: Logging is currently hardcoded to Debug level with JSON format output.
-
-### Production Configuration Recommendations
-
-#### Balanced (128Mi) - Memory Safety Focus
-```json
-{
-  "channels": {
-    "watcher_buffer_size": 300,
-    "es_buffer_size": 60,
-    "backpressure_threshold": 0.8,
-    "backpressure_min_delay_ms": 5,
-    "backpressure_max_delay_ms": 60
-  },
-  "es": {
-    "flush_interval": 1000,
-    "bulk_size": 500,
-    "workers": 1
-  },
-  "max_concurrent_file_readers": 3,
-  "read_existing_on_startup": false,
-  "read_chunk_size": 100,
-  "max_line_size": 524288,
-  "is_debug": false
-}
-```
-
-#### High-Throughput Environment (Large Clusters)
-```json
-{
-  "channels": {
-    "watcher_buffer_size": 2000,
-    "es_buffer_size": 800,
-    "backpressure_threshold": 0.9,
-    "backpressure_min_delay_ms": 2,
-    "backpressure_max_delay_ms": 40
-  },
-  "es": {
-    "flush_interval": 500,
-    "bulk_size": 2000,
-    "workers": 4
-  },
-  "read_existing_on_startup": true,
-  "read_chunk_size": 400,
-  "max_line_size": 2097152,
-  "max_concurrent_file_readers": 20,
-  "is_debug": false
-}
-```
-
-**High-throughput notes:** 
-- SmartTaskPool max limit: 20 workers
-- Optimized for clusters with high log volume
-- `max_line_size: 2MB` - Handles larger log payloads (JSON dumps, stack traces)
-- Resource requirements: ~100Mi memory, 300m CPU
-
-#### Memory-Constrained Environment (<64Mi)
-```json
-{
-  "channels": {
-    "watcher_buffer_size": 500,
-    "es_buffer_size": 200,
-    "backpressure_threshold": 0.7,
-    "backpressure_min_delay_ms": 5,
-    "backpressure_max_delay_ms": 60
-  },
-  "es": {
-    "flush_interval": 2000,
-    "bulk_size": 500,
-    "workers": 1
-  },
-  "read_existing_on_startup": false,
-  "read_chunk_size": 200,
-  "max_line_size": 262144,
-  "max_concurrent_file_readers": 5,
-  "is_debug": false
-}
-```
-
-**Memory-constrained notes:**
-- SmartTaskPool ultra-low setting: max 5 workers
-- `max_line_size: 256KB` - Conservative limit to prevent OOM in tight environments
-- Optimized for minimal resource usage
-- Suitable for edge deployments and small clusters
 
 ### Prometheus Metrics (Optional)
 

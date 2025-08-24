@@ -1,20 +1,19 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, warn};
+use log::warn;
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::Notify;
 use tokio::time::interval;
 
 use crate::Conf;
 use crate::channels::{BoundedReceiver, BoundedSender};
+use crate::error::Result;
 use crate::events::Event;
 use crate::metrics::{are_metrics_enabled, metrics};
 
 pub struct Sender {
     conf: Conf,
-    events: RwLock<VecDeque<Event>>,
     process_queue_receiver: BoundedReceiver<Event>,
     es_queue_sender: BoundedSender<Vec<Event>>,
     metrics_enabled: bool,
@@ -30,147 +29,146 @@ impl Sender {
 
         Sender {
             conf,
-            events: RwLock::new(VecDeque::new()),
             process_queue_receiver: process_queue,
             es_queue_sender,
             metrics_enabled,
         }
     }
 
-    pub async fn run(&mut self, shutdown: Arc<Notify>) -> Result<(), String> {
+    pub async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
         let mut ticker = interval(Duration::from_millis(self.conf.es.flush_interval));
         ticker.tick().await; // Skip the immediate first tick
 
+        let mut batch = Vec::new();
+
         loop {
             tokio::select! {
-                // send by timer
-                 _ = ticker.tick() => {
-
-                    if self.events.read().await.is_empty() {
-                        continue;
+                // Timer-based flush
+                _ = ticker.tick() => {
+                    if !batch.is_empty() {
+                        self.send_batch(&mut batch).await;
                     }
-
-                    loop {
-                        if self.events.read().await.is_empty() {
-                            break;
-                        }
-
-                        let mut events = Vec::new();
-
-                        loop {
-                            // For bulk_size = 0, send all available events
-                            // For bulk_size > 0, send up to bulk_size events
-                            if self.conf.es.bulk_size > 0 && events.len() == self.conf.es.bulk_size {
-                                break;
-                            }
-
-                            match self.events.write().await.pop_front() {
-                                Option::Some(event) => {
-                                    events.push(event);
-                                }
-                                None => {
-                                    debug!("no more events in VecDeque during timer flush");
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Record batch size metric if enabled
-                        if self.metrics_enabled {
-                            metrics().batch_size_histogram
-                                .with_label_values(&["sender"])
-                                .observe(events.len() as f64);
-                        }
-
-                        match self.es_queue_sender.send(events).await {
-                            Ok(()) => {
-                                if self.metrics_enabled {
-                                    metrics().events_processed_total
-                                        .with_label_values(&["sender", "success"])
-                                        .inc();
-                                }
-                            },
-                            Err(e) => {
-                                warn!("Failed to send timer batch to ES workers: {:?}", e);
-                                if self.metrics_enabled {
-                                    metrics().errors_total
-                                        .with_label_values(&["sender", "send_failed"])
-                                        .inc();
-                                }
-                            }
-                        }
-                     }
                 }
 
-                // send by limit
-                event = self.process_queue_receiver.recv() => {
-                    self.events.write().await.push_back(event.unwrap());
+                // Receive events with timeout to avoid hanging
+                event_result = tokio::time::timeout(Duration::from_millis(100), self.process_queue_receiver.recv()) => {
+                    match event_result {
+                        Ok(Ok(event)) => {
+                            batch.push(event);
 
-                    if self.conf.es.bulk_size > 0 && self.events.read().await.len() >= self.conf.es.bulk_size {
-                        let mut events = Vec::new();
-
-                        loop {
-                            if events.len() == self.conf.es.bulk_size {
-                                break;
+                            // Check if we should flush due to size
+                            if self.conf.es.bulk_size > 0 && batch.len() >= self.conf.es.bulk_size {
+                                self.send_batch(&mut batch).await;
                             }
-
-                            events.push(self.events.write().await.pop_front().unwrap());
                         }
-
-                        match self.es_queue_sender.send(events).await {
-                            Ok(()) => {},
-                            Err(e) => warn!("Failed to send bulk size batch to ES workers: {:?}", e),
+                        Ok(Err(_)) => {
+                            log::info!("Process queue closed, initiating graceful shutdown");
+                            if !batch.is_empty() {
+                                self.send_batch(&mut batch).await;
+                            }
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            // Timeout - just continue with the loop to check other branches
+                            continue;
                         }
                     }
                 }
-                 _ = shutdown.notified() => {
-                    log::info!("sender received shutdown signal");
 
-                    // Send remaining events before shutdown
-                    if !self.events.read().await.is_empty() {
+                // Shutdown
+                _ = shutdown.notified() => {
+                    log::info!("Sender received shutdown signal");
+
+                    if !batch.is_empty() {
                         log::info!("Sending remaining events before shutdown");
+                        // Use timeout to avoid hanging during shutdown if ES workers are down
+                        let timeout_result = tokio::time::timeout(
+                            Duration::from_millis(1000),
+                            self.send_batch(&mut batch)
+                        ).await;
 
-                        loop {
-                            if self.events.read().await.is_empty() {
-                                break;
-                            }
-
-                            let mut events = Vec::new();
-
-                            loop {
-                                // For bulk_size = 0, send all remaining events
-                                // For bulk_size > 0, send up to bulk_size events per batch
-                                if self.conf.es.bulk_size > 0 && events.len() == self.conf.es.bulk_size {
-                                    break;
-                                }
-
-                                match self.events.write().await.pop_front() {
-                                    Some(event) => {
-                                        events.push(event);
-                                    }
-                                    None => {
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !events.is_empty() {
-                                match self.es_queue_sender.send(events).await {
-                                    Ok(()) => {
-                                        log::debug!("Sent remaining events batch");
-                                    }
-                                    Err(e) => {
-                                        log::error!("Failed to send remaining events: {}", e);
-                                        break;
-                                    }
-                                }
+                        match timeout_result {
+                            Ok(_) => log::info!("Finished sending remaining events"),
+                            Err(_) => {
+                                log::warn!("Timeout while sending remaining events during shutdown, continuing with shutdown");
                             }
                         }
-
-                        log::info!("Finished sending remaining events");
                     }
 
-                    return Ok(())
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn send_batch(&mut self, batch: &mut Vec<Event>) {
+        if batch.is_empty() {
+            return;
+        }
+
+        // For bulk_size = 0, send all events in one batch
+        // For bulk_size > 0, send events in chunks
+        if self.conf.es.bulk_size == 0 {
+            // Send all events at once
+            let events = std::mem::take(batch);
+            self.send_events_to_es(events).await;
+        } else {
+            // Send events in bulk_size chunks
+            while !batch.is_empty() {
+                let chunk_size = std::cmp::min(batch.len(), self.conf.es.bulk_size);
+                let events = batch.drain(..chunk_size).collect();
+                self.send_events_to_es(events).await;
+            }
+        }
+    }
+
+    async fn send_events_to_es(&mut self, events: Vec<Event>) {
+        if events.is_empty() {
+            return;
+        }
+
+        let event_count = events.len() as u64;
+
+        // Record batch size metric if enabled
+        if self.metrics_enabled {
+            metrics()
+                .batch_size_histogram
+                .with_label_values(&["sender"])
+                .observe(event_count as f64);
+        }
+
+        // Use timeout to prevent hanging if ES workers are unavailable
+        let send_result = tokio::time::timeout(
+            Duration::from_millis(5000),
+            self.es_queue_sender.send(events),
+        )
+        .await;
+
+        match send_result {
+            Ok(Ok(())) => {
+                if self.metrics_enabled {
+                    metrics()
+                        .events_processed_total
+                        .with_label_values(&["sender", "success"])
+                        .inc_by(event_count);
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to send batch to ES workers: {:?}", e);
+                if self.metrics_enabled {
+                    metrics()
+                        .errors_total
+                        .with_label_values(&["sender", "send_failed"])
+                        .inc();
+                }
+            }
+            Err(_) => {
+                warn!("Timeout while sending batch to ES workers, events may be lost");
+                if self.metrics_enabled {
+                    metrics()
+                        .errors_total
+                        .with_label_values(&["sender", "timeout"])
+                        .inc();
                 }
             }
         }
@@ -228,7 +226,6 @@ mod tests {
 
         assert_eq!(sender.conf.es.bulk_size, 10);
         assert_eq!(sender.conf.es.flush_interval, 1000);
-        assert!(sender.events.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -1020,6 +1017,93 @@ mod tests {
 
         assert_eq!(total_batches, 6); // 3 bulk + 3 timer
         assert_eq!(total_events, 18); // 3 * (4 + 2)
+
+        shutdown.notify_one();
+        let _ = timeout(Duration::from_millis(100), sender_handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_metrics_counts_individual_events() {
+        use crate::conf::MetricsConfig;
+        use crate::metrics::{init_metrics, metrics};
+
+        // Initialize metrics for this test
+        let _ = init_metrics();
+
+        let conf = Conf {
+            is_debug: true,
+            log_path: "/tmp/test".to_string(),
+            state_file_path: None,
+            read_existing_on_startup: None,
+            read_chunk_size: None,
+            max_line_size: None,
+            max_concurrent_file_readers: None,
+            channels: None,
+            metrics: Some(MetricsConfig {
+                enabled: Some(true),
+                port: Some(9090),
+                path: Some("/metrics".to_string()),
+            }),
+            logging: None,
+            es: ES {
+                host: "http://localhost".to_string(),
+                port: 9200,
+                index_name: "test".to_string(),
+                flush_interval: 100,
+                bulk_size: 5,
+                workers: 1,
+            },
+        };
+
+        let process_channel: BoundedChannel<Event> = BoundedChannel::new(10, None);
+        let es_channel: BoundedChannel<Vec<Event>> = BoundedChannel::new(10, None);
+
+        let mut process_sender = process_channel.sender();
+        let es_receiver = es_channel.receiver();
+
+        let mut sender = Sender::new(conf, process_channel.receiver(), es_channel.sender());
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = shutdown.clone();
+
+        // Get initial metric value
+        let initial_count = metrics()
+            .events_processed_total
+            .with_label_values(&["sender", "success"])
+            .get();
+
+        let sender_handle = tokio::spawn(async move { sender.run(shutdown_clone).await });
+
+        // Send exactly 5 events to trigger bulk flush
+        for i in 0..5 {
+            process_sender
+                .send(create_test_event(&format!("metrics test {}", i)))
+                .await
+                .unwrap();
+        }
+
+        // Should receive batch of 5 events
+        let batch = timeout(Duration::from_millis(100), es_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.len(), 5);
+
+        // Check that metrics were incremented by the correct count (5, not 1)
+        let final_count = metrics()
+            .events_processed_total
+            .with_label_values(&["sender", "success"])
+            .get();
+
+        let events_counted = final_count - initial_count;
+        assert_eq!(
+            events_counted, 5,
+            "Metrics should count individual events (5), not batches (1). Got: {}",
+            events_counted
+        );
 
         shutdown.notify_one();
         let _ = timeout(Duration::from_millis(100), sender_handle)
