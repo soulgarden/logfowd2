@@ -9,12 +9,12 @@ use reqwest::Client;
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
-use crate::Conf;
-use crate::channels::BoundedReceiver;
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerError, create_es_circuit_breaker};
-use crate::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
+use crate::config::Settings;
+use crate::transport::channels::BoundedReceiver;
+use crate::infrastructure::elasticsearch::circuit_breaker::{CircuitBreaker, CircuitBreakerError, create_es_circuit_breaker};
+use crate::infrastructure::elasticsearch::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
 use crate::error::{EsError, Result};
-use crate::events::Event;
+use crate::domain::event::Event;
 use crate::requests::{FieldsBody, Index};
 use crate::retry::{RetryConfig, RetryManager};
 
@@ -28,7 +28,7 @@ pub struct EsWorkerPool {
 struct EsWorker {
     id: usize,
     http_client: Arc<dyn HttpClient>,
-    conf: Conf,
+    conf: Settings,
     retry_manager: RetryManager,
     circuit_breaker: CircuitBreaker,
     dead_letter_queue: Arc<DeadLetterQueue>,
@@ -311,10 +311,10 @@ impl HttpClient for ReqwestHttpClient {
 
 impl EsWorkerPool {
     pub async fn new(
-        conf: Conf,
+        conf: Settings,
         es_queue_receiver: BoundedReceiver<Vec<Event>>,
     ) -> std::result::Result<Self, EsError> {
-        let worker_count = conf.es.workers as usize;
+        let worker_count = conf.elasticsearch.workers as usize;
 
         // Validate that at least one worker is configured
         if worker_count == 0 {
@@ -453,7 +453,7 @@ impl EsWorkerPool {
 impl EsWorker {
     fn new(
         id: usize,
-        conf: Conf,
+        conf: Settings,
         dead_letter_queue: Arc<DeadLetterQueue>,
     ) -> std::result::Result<Self, EsError> {
         // Create HTTP client with connection pooling
@@ -491,7 +491,7 @@ impl EsWorker {
     #[allow(dead_code)]
     fn new_with_client(
         id: usize,
-        conf: Conf,
+        conf: Settings,
         dead_letter_queue: Arc<DeadLetterQueue>,
         http_client: Arc<dyn HttpClient>,
     ) -> Self {
@@ -728,32 +728,32 @@ impl EsWorker {
 }
 
 // Helper that does not require constructing a worker/client; useful for tests
-pub(crate) fn build_es_url_from_conf(conf: &Conf) -> String {
+pub(crate) fn build_es_url_from_conf(conf: &Settings) -> String {
     format!(
         "{}:{}/{}-{}/_bulk",
-        conf.es.host,
-        conf.es.port,
-        conf.es.index_name,
+        conf.elasticsearch.host,
+        conf.elasticsearch.port,
+        conf.elasticsearch.index_name,
         Utc::now().format("%Y.%m.%d")
     )
 }
 
 // Lightweight helper for testing worker sizing logic without constructing clients
 #[cfg(test)]
-pub(crate) fn planned_worker_count(conf: &Conf) -> usize {
-    conf.es.workers as usize
+pub(crate) fn planned_worker_count(conf: &Settings) -> usize {
+    conf.elasticsearch.workers as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     // Tests would use Event and Meta when more comprehensive tests are added
-    use crate::events::{Event, Meta};
+    use crate::domain::event::{Event, Meta};
 
     #[test]
     fn test_planned_worker_count() {
         let conf = create_test_config();
-        assert_eq!(planned_worker_count(&conf), conf.es.workers as usize);
+        assert_eq!(planned_worker_count(&conf), conf.elasticsearch.workers as usize);
     }
 
     #[test]
@@ -788,7 +788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_process_events_with_di() {
-        use crate::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
+        use crate::infrastructure::elasticsearch::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
         let conf = create_test_config();
         let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig::default()));
         let http = Arc::new(NoopClient);
@@ -829,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_sends_failed_events_to_dlq() {
-        use crate::dead_letter_queue::{DeadLetter, DeadLetterQueue, DeadLetterQueueConfig};
+        use crate::infrastructure::elasticsearch::dead_letter_queue::{DeadLetter, DeadLetterQueue, DeadLetterQueueConfig};
         use tempfile::NamedTempFile;
 
         let conf = create_test_config();
@@ -869,10 +869,10 @@ mod tests {
         assert!(stored.len() >= 2);
     }
 
-    fn create_test_config() -> Conf {
-        use crate::conf::{ChannelConfig, ES};
+    fn create_test_config() -> Settings {
+        use crate::config::settings::{ChannelsConfig, ElasticsearchConfig};
 
-        Conf {
+        Settings {
             is_debug: true,
             log_path: "/test".to_string(),
             state_file_path: Some("/tmp/test.json".to_string()),
@@ -880,7 +880,7 @@ mod tests {
             read_chunk_size: None,
             max_line_size: None,
             max_concurrent_file_readers: Some(50),
-            channels: Some(ChannelConfig {
+            channels: Some(ChannelsConfig {
                 watcher_buffer_size: Some(1000),
                 es_buffer_size: Some(1000),
                 backpressure_threshold: Some(0.8),
@@ -894,7 +894,7 @@ mod tests {
             }),
             metrics: None,
             logging: None,
-            es: ES {
+            elasticsearch: ElasticsearchConfig {
                 host: "http://127.0.0.1".to_string(),
                 port: 9200,
                 index_name: "logfowd".to_string(),
@@ -1194,11 +1194,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_es_worker_pool_zero_workers_validation() {
-        use crate::channels::create_bounded_channel;
+        use crate::transport::channels::create_bounded_channel;
 
         // Create a test config with 0 workers
         let mut conf = create_test_config();
-        conf.es.workers = 0;
+        conf.elasticsearch.workers = 0;
 
         // Create a dummy channel for the test
         let es_queue_channel = create_bounded_channel(10, None, None, None, None);
@@ -1224,12 +1224,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_es_worker_pool_valid_workers() {
-        use crate::channels::create_bounded_channel;
+        use crate::transport::channels::create_bounded_channel;
 
         // Create a test config with 1 worker
         let conf = create_test_config();
         assert!(
-            conf.es.workers > 0,
+            conf.elasticsearch.workers > 0,
             "Test config should have at least 1 worker"
         );
 
@@ -1249,7 +1249,7 @@ mod tests {
     #[test]
     fn test_planned_worker_count_zero() {
         let mut conf = create_test_config();
-        conf.es.workers = 0;
+        conf.elasticsearch.workers = 0;
 
         // The planned_worker_count function should return 0
         assert_eq!(planned_worker_count(&conf), 0);

@@ -1,8 +1,12 @@
+use async_trait::async_trait;
 use log::{debug, info, warn};
+use serde_json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+
+use crate::traits::{HealthCheck, HealthStatus};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CircuitState {
@@ -186,6 +190,40 @@ impl CircuitBreaker {
 
     pub async fn get_state(&self) -> CircuitState {
         self.state.read().await.current_state.clone()
+    }
+}
+
+#[async_trait]
+impl HealthCheck for CircuitBreaker {
+    async fn is_healthy(&self) -> bool {
+        let state = self.get_state().await;
+        matches!(state, CircuitState::Closed)
+    }
+    
+    async fn health_status(&self) -> HealthStatus {
+        let state = self.get_state().await;
+        let failure_count = self.failure_count.load(Ordering::Relaxed);
+        let success_count = self.success_count.load(Ordering::Relaxed);
+        
+        let (healthy, message) = match state {
+            CircuitState::Closed => (true, format!("Circuit breaker '{}' is closed (healthy)", self.name)),
+            CircuitState::Open => (false, format!("Circuit breaker '{}' is open (failing fast)", self.name)),
+            CircuitState::HalfOpen => (false, format!("Circuit breaker '{}' is half-open (testing recovery)", self.name)),
+        };
+        
+        let details = serde_json::json!({
+            "state": format!("{:?}", state),
+            "failure_count": failure_count,
+            "success_count": success_count,
+            "failure_threshold": self.config.failure_threshold,
+            "success_threshold": self.config.success_threshold,
+        });
+        
+        HealthStatus {
+            healthy,
+            message,
+            details: Some(details),
+        }
     }
 }
 

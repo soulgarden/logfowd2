@@ -1,19 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use log::warn;
 
 use tokio::sync::Notify;
 use tokio::time::interval;
 
-use crate::Conf;
-use crate::channels::{BoundedReceiver, BoundedSender};
+use crate::config::Settings;
+use crate::transport::channels::{BoundedReceiver, BoundedSender};
 use crate::error::Result;
-use crate::events::Event;
-use crate::metrics::{are_metrics_enabled, metrics};
+use crate::domain::event::Event;
+use crate::infrastructure::metrics::{are_metrics_enabled, metrics};
+use crate::traits::EventProcessor;
 
 pub struct Sender {
-    conf: Conf,
+    conf: Settings,
     process_queue_receiver: BoundedReceiver<Event>,
     es_queue_sender: BoundedSender<Vec<Event>>,
     metrics_enabled: bool,
@@ -21,7 +23,7 @@ pub struct Sender {
 
 impl Sender {
     pub fn new(
-        conf: Conf,
+        conf: Settings,
         process_queue: BoundedReceiver<Event>,
         es_queue_sender: BoundedSender<Vec<Event>>,
     ) -> Self {
@@ -36,7 +38,7 @@ impl Sender {
     }
 
     pub async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
-        let mut ticker = interval(Duration::from_millis(self.conf.es.flush_interval));
+        let mut ticker = interval(Duration::from_millis(self.conf.elasticsearch.flush_interval));
         ticker.tick().await; // Skip the immediate first tick
 
         let mut batch = Vec::new();
@@ -57,7 +59,7 @@ impl Sender {
                             batch.push(event);
 
                             // Check if we should flush due to size
-                            if self.conf.es.bulk_size > 0 && batch.len() >= self.conf.es.bulk_size {
+                            if self.conf.elasticsearch.bulk_size > 0 && batch.len() >= self.conf.elasticsearch.bulk_size {
                                 self.send_batch(&mut batch).await;
                             }
                         }
@@ -108,14 +110,14 @@ impl Sender {
 
         // For bulk_size = 0, send all events in one batch
         // For bulk_size > 0, send events in chunks
-        if self.conf.es.bulk_size == 0 {
+        if self.conf.elasticsearch.bulk_size == 0 {
             // Send all events at once
             let events = std::mem::take(batch);
             self.send_events_to_es(events).await;
         } else {
             // Send events in bulk_size chunks
             while !batch.is_empty() {
-                let chunk_size = std::cmp::min(batch.len(), self.conf.es.bulk_size);
+                let chunk_size = std::cmp::min(batch.len(), self.conf.elasticsearch.bulk_size);
                 let events = batch.drain(..chunk_size).collect();
                 self.send_events_to_es(events).await;
             }
@@ -175,18 +177,36 @@ impl Sender {
     }
 }
 
+#[async_trait]
+impl EventProcessor for Sender {
+    async fn process(&mut self, event: Event) -> anyhow::Result<()> {
+        // Process a single event by adding it to the batch
+        // This is useful for testing and alternative implementations
+        let mut batch = vec![event];
+        self.send_batch(&mut batch).await;
+        Ok(())
+    }
+    
+    fn can_process(&self) -> bool {
+        // Sender can process if the ES queue is not full
+        // In the current implementation, we always return true as the sender
+        // handles backpressure internally
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::BoundedChannel;
-    use crate::conf::{Conf, ES};
-    use crate::events::{Event, Meta};
+    use crate::transport::channels::BoundedChannel;
+    use crate::config::settings::{Settings, ElasticsearchConfig};
+    use crate::domain::event::{Event, Meta};
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tokio::time::{Duration, sleep, timeout};
 
-    fn create_test_conf(flush_interval: u64, bulk_size: usize) -> Conf {
-        Conf {
+    fn create_test_conf(flush_interval: u64, bulk_size: usize) -> Settings {
+        Settings {
             is_debug: true,
             log_path: "/tmp/test".to_string(),
             state_file_path: None,
@@ -197,7 +217,7 @@ mod tests {
             channels: None,
             metrics: None,
             logging: None,
-            es: ES {
+            elasticsearch: ElasticsearchConfig {
                 host: "http://localhost".to_string(),
                 port: 9200,
                 index_name: "test".to_string(),
@@ -224,8 +244,8 @@ mod tests {
             es_channel.sender(),
         );
 
-        assert_eq!(sender.conf.es.bulk_size, 10);
-        assert_eq!(sender.conf.es.flush_interval, 1000);
+        assert_eq!(sender.conf.elasticsearch.bulk_size, 10);
+        assert_eq!(sender.conf.elasticsearch.flush_interval, 1000);
     }
 
     #[tokio::test]
@@ -608,8 +628,8 @@ mod tests {
                 es_channel.sender(),
             );
 
-            assert_eq!(sender.conf.es.flush_interval, conf.es.flush_interval);
-            assert_eq!(sender.conf.es.bulk_size, conf.es.bulk_size);
+            assert_eq!(sender.conf.elasticsearch.flush_interval, conf.elasticsearch.flush_interval);
+            assert_eq!(sender.conf.elasticsearch.bulk_size, conf.elasticsearch.bulk_size);
         }
     }
 
@@ -1027,13 +1047,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_counts_individual_events() {
-        use crate::conf::MetricsConfig;
-        use crate::metrics::{init_metrics, metrics};
+        use crate::config::settings::MetricsConfig;
+        use crate::infrastructure::metrics::{init_metrics, metrics};
 
         // Initialize metrics for this test
         let _ = init_metrics();
 
-        let conf = Conf {
+        let conf = Settings {
             is_debug: true,
             log_path: "/tmp/test".to_string(),
             state_file_path: None,
@@ -1043,12 +1063,12 @@ mod tests {
             max_concurrent_file_readers: None,
             channels: None,
             metrics: Some(MetricsConfig {
-                enabled: Some(true),
-                port: Some(9090),
-                path: Some("/metrics".to_string()),
+                enabled: true,
+                port: 9090,
+                path: "/metrics".to_string(),
             }),
             logging: None,
-            es: ES {
+            elasticsearch: ElasticsearchConfig {
                 host: "http://localhost".to_string(),
                 port: 9200,
                 index_name: "test".to_string(),

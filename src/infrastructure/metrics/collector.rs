@@ -211,8 +211,8 @@ pub fn metrics() -> &'static LogfwdMetrics {
 }
 
 // Check if metrics are enabled from config
-pub fn are_metrics_enabled(config: &Option<crate::conf::MetricsConfig>) -> bool {
-    config.as_ref().and_then(|c| c.enabled).unwrap_or(false) // Default to disabled
+pub fn are_metrics_enabled(config: &Option<crate::config::MetricsConfig>) -> bool {
+    config.as_ref().map(|c| c.enabled).unwrap_or(false) // Default to disabled
 }
 
 // Safe metrics operations - only execute if metrics are enabled

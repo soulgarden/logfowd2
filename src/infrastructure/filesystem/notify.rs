@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::metrics::metrics;
+use crate::infrastructure::metrics::metrics;
 
 /// NotifyBridge provides a two-tier channel architecture to prevent notify callback blocking.
 /// It uses an unbounded channel for the notify callback and bridges to a bounded channel

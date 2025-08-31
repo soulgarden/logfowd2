@@ -4,7 +4,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum AppError {
     #[error("Configuration error: {0}")]
-    Config(#[from] crate::conf::ConfError),
+    Config(String),
 
     #[error("File system error: {0}")]
     Io(#[from] std::io::Error),

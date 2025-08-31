@@ -6,12 +6,27 @@ use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use crate::channels::BoundedSender;
-use crate::events::Event;
-use crate::file_tracker::FileTracker;
-use crate::state::AppState;
+use crate::transport::channels::BoundedSender;
+use crate::domain::event::Event;
+use crate::domain::file::FileTracker;
+use crate::domain::state::AppState;
 
 /// Smart TaskPool with dynamic scaling and memory optimization
+/// 
+/// This component is designed for future integration with the Watcher to enable
+/// parallel file reading, which would significantly improve performance when 
+/// processing many log files concurrently. The configuration field 
+/// `max_concurrent_file_readers` is already validated in config and can control
+/// the pool size (2-10 workers with dynamic scaling).
+/// 
+/// Benefits when integrated:
+/// - Parallel processing of multiple log files
+/// - Dynamic worker scaling based on load
+/// - Memory optimization through bounded concurrency
+/// - Automatic idle worker timeout (30s) to free resources
+/// 
+/// TODO: Integrate into Watcher for parallel file processing
+// Kept for future parallel file processing optimization
 #[allow(dead_code)]
 pub struct SmartTaskPool {
     min_workers: usize,

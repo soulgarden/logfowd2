@@ -9,36 +9,28 @@ use json_env_logger2::builder;
 use json_env_logger2::env_logger::Target;
 use log::{LevelFilter, warn};
 
-use crate::channels::create_bounded_channel;
-use crate::conf::Conf;
+use crate::config::Settings;
 use crate::error::{AppError, Result};
-use crate::es_worker_pool::EsWorkerPool;
-use crate::metrics_server::MetricsServer;
+use crate::infrastructure::elasticsearch::EsWorkerPool;
+use crate::infrastructure::metrics::MetricsServer;
 use crate::sender::Sender;
 use crate::signals::listen_signals;
+use crate::transport::channels::create_bounded_channel;
 use crate::watcher::Watcher;
 
-mod channels;
-mod circuit_breaker;
-mod conf;
-mod dead_letter_queue;
+mod config;
+mod domain;
 mod error;
-mod es_worker_pool;
-mod event_bridge;
-mod events;
-mod file_tracker;
+mod infrastructure;
 #[cfg(test)]
 mod integration_tests;
-mod metadata_cache;
-mod metrics;
-mod metrics_server;
-mod notify_bridge;
 mod requests;
 mod retry;
 mod sender;
 mod signals;
-mod state;
 mod task_pool;
+mod traits;
+mod transport;
 mod watcher;
 
 #[tokio::main]
@@ -51,15 +43,15 @@ async fn main() -> Result<()> {
     builder.filter_level(LevelFilter::Debug);
     builder.try_init().unwrap();
 
-    let conf = Conf::new().map_err(|err| {
+    let conf = Settings::load().map_err(|err| {
         warn!("failed to load configuration, {}", err);
-        err
+        AppError::Config(err.to_string())
     })?;
 
     // Initialize metrics system only if enabled
-    let metrics_enabled = crate::metrics::are_metrics_enabled(&conf.metrics);
+    let metrics_enabled = crate::infrastructure::metrics::are_metrics_enabled(&conf.metrics);
     if metrics_enabled {
-        if let Err(e) = crate::metrics::init_metrics() {
+        if let Err(e) = crate::infrastructure::metrics::init_metrics() {
             warn!("Failed to initialize metrics: {}", e);
         } else {
             log::info!("Metrics system initialized and enabled");

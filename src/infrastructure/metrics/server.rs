@@ -8,8 +8,8 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 use tower::ServiceBuilder;
 
-use crate::conf::MetricsConfig;
-use crate::metrics::metrics;
+use crate::config::MetricsConfig;
+use crate::infrastructure::metrics::metrics;
 
 pub struct MetricsServer {
     config: MetricsConfig,
@@ -21,14 +21,14 @@ impl MetricsServer {
     }
 
     pub async fn run(&self, shutdown: Arc<Notify>) -> Result<(), Box<dyn std::error::Error>> {
-        let enabled = self.config.enabled.unwrap_or(false);
+        let enabled = self.config.enabled;
         if !enabled {
             info!("Metrics server disabled in configuration");
             return Ok(());
         }
 
-        let port = self.config.port.unwrap_or(9090);
-        let path = self.config.path.as_deref().unwrap_or("/metrics");
+        let port = self.config.port;
+        let path = &self.config.path;
 
         let app = Router::new()
             .route(path, get(metrics_handler))
@@ -81,15 +81,15 @@ async fn health_handler() -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conf::MetricsConfig;
+    use crate::config::settings::MetricsConfig;
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn test_metrics_server_disabled() {
         let config = MetricsConfig {
-            enabled: Some(false),
-            port: Some(9091),
-            path: Some("/test-metrics".to_string()),
+            enabled: false,
+            port: 9091,
+            path: "/test-metrics".to_string(),
         };
 
         let server = MetricsServer::new(config);
@@ -112,9 +112,9 @@ mod tests {
     async fn test_metrics_server_default_disabled() {
         // Test with enabled: None to verify default behavior
         let config = MetricsConfig {
-            enabled: None, // This should default to false (disabled)
-            port: Some(9092),
-            path: Some("/test-default-metrics".to_string()),
+            enabled: false, // Default value
+            port: 9092,
+            path: "/test-default-metrics".to_string(),
         };
 
         let server = MetricsServer::new(config);
@@ -135,14 +135,14 @@ mod tests {
 
     #[test]
     fn test_consistency_with_are_metrics_enabled() {
-        use crate::metrics::are_metrics_enabled;
+        use crate::infrastructure::metrics::are_metrics_enabled;
 
         // Test that both functions have the same default behavior
         let config_none: Option<MetricsConfig> = None;
         let config_enabled_none = Some(MetricsConfig {
-            enabled: None,
-            port: Some(9090),
-            path: Some("/metrics".to_string()),
+            enabled: false,
+            port: 9090,
+            path: "/metrics".to_string(),
         });
 
         // Both should return false when config is None or enabled is None
@@ -162,17 +162,16 @@ mod tests {
             config_enabled_none
                 .as_ref()
                 .unwrap()
-                .enabled
-                .unwrap_or(false),
+                .enabled,
             false,
-            "metrics_server should also default to false when enabled is None"
+            "metrics_server should also default to false when enabled is false"
         );
     }
 
     #[tokio::test]
     async fn test_metrics_handler() {
         // Try to initialize metrics, ignore if already initialized
-        let _ = crate::metrics::init_metrics();
+        let _ = crate::infrastructure::metrics::init_metrics();
 
         let _response = metrics_handler().await;
 
