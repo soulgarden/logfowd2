@@ -9,7 +9,7 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
-use crate::events::Event;
+use crate::domain::event::Event;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeadLetter {
@@ -245,7 +245,7 @@ impl Clone for DeadLetterStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{Event, Meta};
+    use crate::domain::event::{Event, Meta};
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::NamedTempFile;

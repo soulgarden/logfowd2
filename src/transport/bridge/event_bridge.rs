@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::channels::{BoundedSender, SendError};
-use crate::events::Event;
-use crate::metrics::metrics;
+use crate::transport::channels::{BoundedSender, SendError};
+use crate::domain::event::Event;
+use crate::infrastructure::metrics::metrics;
 
 /// EventBridge provides a two-tier channel architecture to prevent notify callback blocking.
 /// It uses an unbounded channel for the notify callback and bridges to a bounded channel
@@ -288,8 +288,8 @@ impl std::error::Error for NotifyEventSendError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::create_bounded_channel;
-    use crate::events::{Event, Meta};
+    use crate::transport::channels::create_bounded_channel;
+    use crate::domain::event::{Event, Meta};
     use std::time::Duration;
     use tokio::time;
 

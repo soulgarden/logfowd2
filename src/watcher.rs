@@ -16,20 +16,20 @@ use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::interval;
 
-use crate::Conf;
-use crate::channels::BoundedSender;
-use crate::event_bridge::{EventBridge, EventBridgeConfig, NotifyEventSender};
-use crate::events::{Event, Meta};
-use crate::file_tracker::FileTracker;
-use crate::metrics::{are_metrics_enabled, metrics};
-use crate::notify_bridge::{NotifyBridge, NotifyBridgeConfig, NotifyFilesystemSender};
-use crate::state::AppState;
+use crate::config::Settings;
+use crate::transport::channels::BoundedSender;
+use crate::transport::bridge::{EventBridge, EventBridgeConfig, NotifyEventSender};
+use crate::domain::event::{Event, Meta};
+use crate::domain::file::FileTracker;
+use crate::infrastructure::metrics::{are_metrics_enabled, metrics};
+use crate::infrastructure::filesystem::notify::{NotifyBridge, NotifyBridgeConfig, NotifyFilesystemSender};
+use crate::domain::state::AppState;
 use crate::task_pool::SmartTaskPool;
 
 const K8S_PODS_REGEXP: &str = r"^/var/log/pods/(?P<namespace>[a-z0-9-]+)_(?P<pod_name>[a-z0-9-]+)_(?P<pod_id>[a-z0-9-]+)/(?P<container_name>[a-z-0-9]+)/(?P<num>0|[1-9][0-9]*).log$";
 
 pub struct Watcher {
-    conf: Conf,
+    conf: Settings,
     file_trackers: HashMap<String, FileTracker>,
     process_queue_sender: BoundedSender<Event>,
     regexp: Regex,
@@ -52,7 +52,7 @@ impl Watcher {
         path.to_str().map(|s| s.to_string())
     }
 
-    pub fn new(conf: Conf, process_queue_sender: BoundedSender<Event>) -> Self {
+    pub fn new(conf: Settings, process_queue_sender: BoundedSender<Event>) -> Self {
         let state_file_path = conf
             .state_file_path
             .clone()
@@ -171,7 +171,7 @@ impl Watcher {
 
                         if let Err(e) = state_snapshot.save_to_file(&state_file_path) {
                             match e {
-                                crate::state::StateError::IoError(io_err)
+                                crate::domain::state::StateError::IoError(io_err)
                                     if io_err.kind() == std::io::ErrorKind::StorageFull => {
                                     error!("Failed to save state due to insufficient disk space: {}", io_err);
                                     warn!("Application will continue but state persistence is degraded");
@@ -192,7 +192,7 @@ impl Watcher {
 
                         if let Err(e) = state_snapshot.save_to_file(&state_file_path) {
                             match e {
-                                crate::state::StateError::IoError(io_err)
+                                crate::domain::state::StateError::IoError(io_err)
                                     if io_err.kind() == std::io::ErrorKind::StorageFull => {
                                     error!("Failed to save final state due to insufficient disk space: {}", io_err);
                                     warn!("Final state not saved due to disk space constraints");
@@ -634,7 +634,7 @@ impl Watcher {
         }
 
         // Create FileTracker with temporary state - will be updated with real state later
-        let mut temp_state = crate::state::AppState::new();
+        let mut temp_state = crate::domain::state::AppState::new();
         let tracker = FileTracker::new_with_max_line_size(
             path_str,
             meta.clone(),
@@ -851,7 +851,7 @@ impl Watcher {
     async fn safe_send_event(&mut self, event: Event) {
         match self.notify_sender.try_send(event) {
             Ok(()) => {}
-            Err(crate::event_bridge::NotifyEventSendError::ChannelClosed) => {
+            Err(crate::transport::bridge::NotifyEventSendError::ChannelClosed) => {
                 warn!("Notify event channel closed, unable to send event");
             }
         }
@@ -865,7 +865,7 @@ impl Watcher {
                 Ok(()) => {
                     successful_sends += 1;
                 }
-                Err(crate::event_bridge::NotifyEventSendError::ChannelClosed) => {
+                Err(crate::transport::bridge::NotifyEventSendError::ChannelClosed) => {
                     warn!("Notify event channel closed, unable to send event");
                     break; // No point trying to send more if channel is closed
                 }
@@ -885,12 +885,12 @@ impl Watcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::create_bounded_channel;
+    use crate::transport::channels::create_bounded_channel;
     use std::fs;
     use tempfile::TempDir;
     // use std::path::PathBuf; // Unused
 
-    fn create_test_conf() -> Conf {
+    fn create_test_conf() -> Settings {
         serde_json::from_str(
             r#"
         {
@@ -1499,7 +1499,7 @@ mod tests {
     async fn test_directory_removal_events_are_handled_gracefully() {
         // Test that directory removal events don't cause "unknown file" warnings
         let conf = create_test_conf();
-        let channel = create_bounded_channel::<crate::events::Event>(100, None, None, None, None);
+        let channel = create_bounded_channel::<crate::domain::event::Event>(100, None, None, None, None);
         let sender = channel.sender();
         let watcher = Watcher::new(conf, sender);
 

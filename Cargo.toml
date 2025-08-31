@@ -29,6 +29,7 @@ prometheus = "0.13"
 axum = "0.7"
 tower = "0.4"
 thiserror = "1.0"
+anyhow = "1.0"
 
 [dependencies.uuid]
 version = "1.4.0"

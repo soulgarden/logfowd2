@@ -7,9 +7,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom
 
 use log::{debug, error, info, warn};
 
-use crate::events::{Event, Meta};
-use crate::metadata_cache::{FileMetadata, MetadataCache};
-use crate::state::AppState;
+use crate::domain::event::{Event, Meta};
+use crate::domain::state::AppState;
+use crate::infrastructure::filesystem::metadata_cache::{FileMetadata, MetadataCache};
 
 pub struct FileTracker {
     pub path: String,
@@ -508,17 +508,20 @@ impl FileTracker {
         }
     }
 
-    #[allow(dead_code)] // Utility method for debugging/diagnostics
+    /// Check if the file is currently open (test utility)
+    #[cfg(test)]
     pub fn is_open(&self) -> bool {
         self.file.is_some()
     }
 
-    #[allow(dead_code)] // Utility method for debugging/diagnostics
+    /// Get current file position (test utility)
+    #[cfg(test)]
     pub fn get_position(&self) -> u64 {
         self.position
     }
 
-    #[allow(dead_code)] // Utility method for debugging/diagnostics
+    /// Get the current inode number (test utility)
+    #[allow(dead_code)]
     pub fn get_inode(&self) -> u64 {
         self.inode
     }
@@ -529,16 +532,16 @@ impl FileTracker {
         }
     }
 
-    /// Get cached metadata for a path
-    #[allow(dead_code)]
+    /// Get cached metadata for a path (test utility)
+    #[allow(dead_code)] // Used in tests
     fn get_cached_metadata(&mut self, path: &str) -> Result<FileMetadata, std::io::Error> {
         self.metadata_cache.get_metadata(path).map_err(|e| {
             std::io::Error::other(format!("Failed to get metadata for {}: {}", path, e))
         })
     }
 
-    /// Force refresh cached metadata for a path  
-    #[allow(dead_code)]
+    /// Force refresh cached metadata for a path (test utility)
+    #[allow(dead_code)] // Used in tests
     fn refresh_cached_metadata(&mut self, path: &str) -> Result<FileMetadata, std::io::Error> {
         self.metadata_cache.refresh_metadata(path).map_err(|e| {
             std::io::Error::other(format!("Failed to refresh metadata for {}: {}", path, e))
@@ -717,44 +720,6 @@ impl FileTracker {
         sanitized.to_string()
     }
 
-    /// Retry file access with exponential backoff for permission errors
-    #[allow(dead_code)]
-    async fn retry_file_access<F, T, Fut>(
-        path: &str,
-        operation: F,
-        max_retries: u32,
-    ) -> Result<T, std::io::Error>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<T, std::io::Error>>,
-    {
-        let mut retries = 0;
-        let mut delay = Duration::from_millis(100); // Start with 100ms
-
-        loop {
-            match operation().await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    if retries >= max_retries {
-                        return Err(e);
-                    }
-
-                    match e.kind() {
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other => {
-                            retries += 1;
-                            debug!(
-                                "Retry {}/{} for {} after permission error: {}",
-                                retries, max_retries, path, e
-                            );
-                            tokio::time::sleep(delay).await;
-                            delay = std::cmp::min(delay * 2, Duration::from_secs(5)); // Max 5 seconds
-                        }
-                        _ => return Err(e), // Don't retry for other errors
-                    }
-                }
-            }
-        }
-    }
 
     /// Handle file access errors with specific logic for permission denied
     fn handle_file_access_error<T>(path: &str, error: std::io::Error) -> Result<T, std::io::Error> {
@@ -799,8 +764,8 @@ impl FileTracker {
         }
     }
 
-    /// Check if file shows signs of corruption or issues
-    #[allow(dead_code)]
+    /// Check if file shows signs of corruption or issues (test utility)
+    #[allow(dead_code)] // Used in tests
     async fn check_file_health(&mut self) -> Result<bool, std::io::Error> {
         if let Some(ref mut file) = self.file {
             let current_pos = file.seek(SeekFrom::Current(0)).await?;

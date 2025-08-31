@@ -9,11 +9,11 @@ use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
 
 #[cfg(test)]
-use crate::channels::create_bounded_channel;
+use crate::transport::channels::create_bounded_channel;
 #[cfg(test)]
-use crate::conf::Conf;
+use crate::config::Settings;
 #[cfg(test)]
-use crate::events::{Event, Meta};
+use crate::domain::event::{Event, Meta};
 #[cfg(test)]
 use crate::watcher::Watcher;
 
@@ -22,7 +22,7 @@ mod tests {
     use super::*;
 
     // Helper function to create a test config
-    fn create_test_config() -> Conf {
+    fn create_test_config() -> Settings {
         serde_json::from_str(
             r#"
         {
@@ -98,14 +98,14 @@ mod tests {
 
         // Test direct JSON parsing instead of environment variable
         // (avoiding unsafe env var manipulation)
-        let conf: Conf =
+        let conf: Settings =
             serde_json::from_str(config_content).expect("Failed to parse integration test config");
 
         // Verify config was loaded correctly
         assert!(conf.is_debug);
         assert_eq!(conf.log_path, "/tmp/integration_test");
-        assert_eq!(conf.es.host, "http://test-es");
-        assert_eq!(conf.es.bulk_size, 50);
+        assert_eq!(conf.elasticsearch.host, "http://test-es");
+        assert_eq!(conf.elasticsearch.bulk_size, 50);
         assert_eq!(
             conf.channels.as_ref().unwrap().watcher_buffer_size,
             Some(1000)
@@ -270,8 +270,8 @@ mod tests {
         // Create config
         let mut conf = create_test_config();
         conf.log_path = temp_dir.path().to_string_lossy().to_string();
-        conf.es.flush_interval = 50; // Fast flush for testing
-        conf.es.bulk_size = 2; // Small batch size
+        conf.elasticsearch.flush_interval = 50; // Fast flush for testing
+        conf.elasticsearch.bulk_size = 2; // Small batch size
 
         // Create sender
         let mut sender = crate::sender::Sender::new(conf.clone(), watcher_receiver, es_sender);
@@ -314,8 +314,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sender_to_es_workers_integration() {
-        use crate::channels::BoundedChannel;
-        use crate::events::Event;
+        use crate::transport::channels::BoundedChannel;
+        use crate::domain::event::Event;
 
         // Create channels for sender -> ES workers communication
         let es_channel: BoundedChannel<Vec<Event>> =
@@ -447,8 +447,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_pipeline_single_file() {
-        use crate::file_tracker::FileTracker;
-        use crate::state::AppState;
+        use crate::domain::file::FileTracker;
+        use crate::domain::state::AppState;
 
         let temp_dir = TempDir::new().unwrap();
 
@@ -477,14 +477,14 @@ mod tests {
             .join("var/log/pods")
             .to_string_lossy()
             .to_string();
-        conf.es.flush_interval = 50; // Fast processing
-        conf.es.bulk_size = 1; // Process immediately
+        conf.elasticsearch.flush_interval = 50; // Fast processing
+        conf.elasticsearch.bulk_size = 1; // Process immediately
 
         // Create file tracker manually (simulating what watcher does)
         let mut app_state = AppState::new();
         let mut file_tracker = FileTracker::new(
             log_file.to_string_lossy().to_string(),
-            crate::events::Meta::default(),
+            crate::domain::event::Meta::default(),
             &mut app_state,
         )
         .await
@@ -610,15 +610,15 @@ mod tests {
             "Should not receive historical events when skipping"
         );
 
-        // Shutdown
-        notify.notify_one();
-        let _ = timeout(Duration::from_millis(1000), handle).await.unwrap();
+        // Shutdown - use notify_waiters() to wake all tasks
+        notify.notify_waiters();
+        let _ = timeout(Duration::from_secs(10), handle).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_file_rotation_pipeline() {
-        use crate::file_tracker::FileTracker;
-        use crate::state::AppState;
+        use crate::domain::file::FileTracker;
+        use crate::domain::state::AppState;
 
         let temp_dir = TempDir::new().unwrap();
         let log_file = temp_dir.path().join("rotating.log");
@@ -630,7 +630,7 @@ mod tests {
         let mut app_state = AppState::new();
         let mut file_tracker = FileTracker::new(
             log_file.to_string_lossy().to_string(),
-            crate::events::Meta::default(),
+            crate::domain::event::Meta::default(),
             &mut app_state,
         )
         .await
