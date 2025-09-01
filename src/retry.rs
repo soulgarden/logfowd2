@@ -1,4 +1,4 @@
-use log::{debug, warn};
+use tracing::{debug, warn};
 use std::time::Duration;
 use tokio::time::sleep;
 

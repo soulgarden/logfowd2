@@ -1,6 +1,5 @@
 {
   "log_path": "/var/log/pods",
-  "is_debug": false,
   "state_file_path": "/tmp/logfowd2_state.json",
   "read_existing_on_startup": false,
   "read_chunk_size": 200,
@@ -24,8 +23,8 @@
     "path": "/metrics"
   },
   "logging": {
-    "level": "info",
-    "format": "simple"
+    "log_level": "info",
+    "log_format": "json"
   },
   "es": {
     "host": "http://127.0.0.1",

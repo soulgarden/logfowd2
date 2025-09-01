@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::domain::event::{Event, Meta};
 use crate::domain::state::AppState;

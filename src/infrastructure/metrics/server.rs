@@ -3,7 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use log::{error, info};
+use tracing::{error, info};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tower::ServiceBuilder;

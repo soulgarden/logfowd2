@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::BufMut;
 use chrono::Utc;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use reqwest::Client;
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -873,7 +873,6 @@ mod tests {
         use crate::config::settings::{ChannelsConfig, ElasticsearchConfig};
 
         Settings {
-            is_debug: true,
             log_path: "/test".to_string(),
             state_file_path: Some("/tmp/test.json".to_string()),
             read_existing_on_startup: None,

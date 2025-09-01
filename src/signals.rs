@@ -3,6 +3,7 @@ use std::sync::Arc;
 use libc::{SIGINT, SIGTERM};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
+use tracing::info;
 
 use crate::error::Result;
 
@@ -19,11 +20,11 @@ pub fn listen_signals() -> Result<Arc<Notify>> {
 
             notify.notify_waiters();
 
-            log::info!("shutdown signal received");
+            info!("shutdown signal received");
         });
     }
 
-    log::info!("waiting for signal");
+    info!("waiting for signal");
 
     Ok(notify)
 }
@@ -112,7 +113,7 @@ mod tests {
             loop {
                 tokio::select! {
                     _ = &mut shutdown_fut => {
-                        log::info!("Component received shutdown signal");
+                        info!("Component received shutdown signal");
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(1)) => {

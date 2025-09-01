@@ -5,9 +5,8 @@ extern crate core;
 
 use std::sync::Arc;
 
-use json_env_logger2::builder;
-use json_env_logger2::env_logger::Target;
-use log::{LevelFilter, warn};
+use tracing::{error, info, warn};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use crate::config::Settings;
 use crate::error::{AppError, Result};
@@ -33,20 +32,41 @@ mod traits;
 mod transport;
 mod watcher;
 
+fn init_tracing(config: &Settings) {
+    let logging_config = config.logging.clone().unwrap_or_default();
+    let filter = EnvFilter::new(&logging_config.log_level);
+
+    if logging_config.log_format == "json" {
+        // JSON formatted output for monitoring systems
+        tracing_subscriber::registry()
+            .with(
+                fmt::layer()
+                    .json()
+                    .with_current_span(false)
+                    .with_span_list(false)
+                    .with_timer(fmt::time::UtcTime::rfc_3339())
+                    .with_target(true),
+            )
+            .with(filter)
+            .init();
+    } else {
+        // Human-readable output for development
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(filter)
+            .init();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    json_env_logger2::panic_hook();
-
-    let mut builder = builder();
-
-    builder.target(Target::Stdout);
-    builder.filter_level(LevelFilter::Debug);
-    builder.try_init().unwrap();
-
     let conf = Settings::load().map_err(|err| {
-        warn!("failed to load configuration, {}", err);
+        eprintln!("failed to load configuration, {}", err);
         AppError::Config(err.to_string())
     })?;
+
+    // Initialize tracing based on configuration
+    init_tracing(&conf);
 
     // Initialize metrics system only if enabled
     let metrics_enabled = crate::infrastructure::metrics::are_metrics_enabled(&conf.metrics);
@@ -54,14 +74,10 @@ async fn main() -> Result<()> {
         if let Err(e) = crate::infrastructure::metrics::init_metrics() {
             warn!("Failed to initialize metrics: {}", e);
         } else {
-            log::info!("Metrics system initialized and enabled");
+            info!("Metrics system initialized and enabled");
         }
     } else {
-        log::info!("Metrics system disabled in configuration");
-    }
-
-    if !conf.is_debug {
-        log::set_max_level(LevelFilter::Info);
+        info!("Metrics system disabled in configuration");
     }
 
     let shutdown_notify: Arc<tokio::sync::Notify> = listen_signals()?;
@@ -135,7 +151,7 @@ async fn main() -> Result<()> {
         )
     } else {
         // Start components without metrics server
-        log::info!("Metrics server disabled - starting core components only");
+        info!("Metrics server disabled - starting core components only");
         tokio::try_join!(
             async move {
                 watcher
@@ -155,7 +171,7 @@ async fn main() -> Result<()> {
             async move {
                 tokio::select! {
                     _ = metrics_shutdown_notify.notified() => {
-                        log::info!("Dummy metrics task received shutdown signal");
+                        info!("Dummy metrics task received shutdown signal");
                     }
                 }
                 Ok::<(), AppError>(())
@@ -165,11 +181,11 @@ async fn main() -> Result<()> {
 
     match result {
         Ok(_) => {
-            log::info!("shutdown completed");
+            info!("shutdown completed");
             Ok(())
         }
         Err(e) => {
-            log::error!("component failure: {}", e);
+            error!("component failure: {}", e);
             Err(e)
         }
     }

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use log::{debug, info, warn};
+use tracing::{debug, info, warn};
 use serde_json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

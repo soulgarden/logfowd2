@@ -8,8 +8,11 @@ data:
   config.json: |
     {
       "log_path": "{{ .Values.app.logs_path }}",
-      "is_debug": {{ .Values.app.debug_mode }},
       "state_file_path": "{{ .Values.app.state_file_path }}",
+      "logging": {
+        "log_level": "{{ .Values.app.logging.log_level | default "info" }}",
+        "log_format": "{{ .Values.app.logging.log_format | default "simple" }}"
+      },
       "read_existing_on_startup": {{ .Values.app.read_existing_on_startup | default false }},
       "read_chunk_size": {{ .Values.app.read_chunk_size | default 200 }},
       "max_line_size": {{ .Values.app.max_line_size | default 1048576 }},
