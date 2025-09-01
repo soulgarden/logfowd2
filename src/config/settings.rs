@@ -6,7 +6,6 @@ use std::path::Path;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Settings {
-    pub is_debug: bool,
     pub log_path: String,
     
     #[serde(rename = "es")]
@@ -69,11 +68,11 @@ pub struct MetricsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct LoggingConfig {
-    #[serde(default = "default_log_level")]
-    pub level: String,
-    
     #[serde(default = "default_log_format")]
-    pub format: String,
+    pub log_format: String,
+    
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
 }
 
 // Default functions for serde
@@ -96,8 +95,8 @@ impl Default for MetricsConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            level: default_log_level(),
-            format: default_log_format(),
+            log_format: default_log_format(),
+            log_level: default_log_level(),
         }
     }
 }
@@ -286,13 +285,13 @@ impl Settings {
     fn validate_logging(&self) -> Result<()> {
         if let Some(logging) = &self.logging {
             const VALID_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error"];
-            if !VALID_LEVELS.contains(&logging.level.as_str()) {
-                bail!("logging.level must be one of {:?}, got: '{}'", VALID_LEVELS, logging.level);
+            if !VALID_LEVELS.contains(&logging.log_level.as_str()) {
+                bail!("logging.log_level must be one of {:?}, got: '{}'", VALID_LEVELS, logging.log_level);
             }
             
-            const VALID_FORMATS: &[&str] = &["simple", "structured"];
-            if !VALID_FORMATS.contains(&logging.format.as_str()) {
-                bail!("logging.format must be one of {:?}, got: '{}'", VALID_FORMATS, logging.format);
+            const VALID_FORMATS: &[&str] = &["simple", "json"];
+            if !VALID_FORMATS.contains(&logging.log_format.as_str()) {
+                bail!("logging.log_format must be one of {:?}, got: '{}'", VALID_FORMATS, logging.log_format);
             }
         }
         
@@ -309,7 +308,6 @@ mod tests {
     fn test_json_deserialization() {
         let config_json = r#"
         {
-            "is_debug": true,
             "log_path": "/var/log/pods",
             "state_file_path": "/tmp/state.json",
             "max_concurrent_file_readers": 100,
@@ -334,7 +332,6 @@ mod tests {
 
         let settings: Settings = serde_json::from_str(config_json).unwrap();
 
-        assert!(settings.is_debug);
         assert_eq!(settings.log_path, "/var/log/pods");
         assert_eq!(settings.state_file_path, Some("/tmp/state.json".to_string()));
         assert_eq!(settings.max_concurrent_file_readers, Some(100));
@@ -361,7 +358,6 @@ mod tests {
     fn test_minimal_json_deserialization() {
         let config_json = r#"
         {
-            "is_debug": false,
             "log_path": "/test/logs",
             "es": {
                 "host": "http://es-server",
@@ -376,7 +372,6 @@ mod tests {
 
         let settings: Settings = serde_json::from_str(config_json).unwrap();
 
-        assert!(!settings.is_debug);
         assert_eq!(settings.log_path, "/test/logs");
         assert_eq!(settings.state_file_path, None);
         assert_eq!(settings.max_concurrent_file_readers, None);
@@ -398,7 +393,7 @@ mod tests {
     fn test_missing_required_fields() {
         let incomplete_config = r#"
         {
-            "is_debug": true
+            "log_path": "/test"
         }
         "#;
 
@@ -410,7 +405,6 @@ mod tests {
     fn test_channels_config_optional_fields() {
         let config_json = r#"
         {
-            "is_debug": true,
             "log_path": "/var/log",
             "channels": {
                 "watcher_buffer_size": 1000
@@ -440,7 +434,6 @@ mod tests {
     #[test]
     fn test_settings_cloning() {
         let settings = Settings {
-            is_debug: true,
             log_path: "/test/path".to_string(),
             state_file_path: Some("/test/state.json".to_string()),
             read_existing_on_startup: None,
@@ -462,7 +455,6 @@ mod tests {
 
         let cloned = settings.clone();
 
-        assert_eq!(settings.is_debug, cloned.is_debug);
         assert_eq!(settings.log_path, cloned.log_path);
         assert_eq!(settings.state_file_path, cloned.state_file_path);
         assert_eq!(settings.elasticsearch.host, cloned.elasticsearch.host);

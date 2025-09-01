@@ -1,4 +1,4 @@
-use log::debug;
+use tracing::debug;
 use std::collections::HashMap;
 use std::fs;
 use std::time::{Duration, Instant};

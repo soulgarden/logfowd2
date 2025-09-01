@@ -77,7 +77,9 @@ tolerations: [ ]
 
 app:
   env: prod
-  debug_mode: false
+  logging:
+    log_level: "info"
+    log_format: "json"
   state_file_path: "/tmp/logfowd2_state.json"
   read_existing_on_startup: false
   read_chunk_size: 100

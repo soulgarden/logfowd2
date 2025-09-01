@@ -1,5 +1,5 @@
 use async_channel::{Receiver, Sender};
-use log::{debug, warn};
+use tracing::{debug, warn};
 use std::time::{Duration, Instant};
 use tokio::time;
 

@@ -32,6 +32,7 @@ Logfowd2 is a memory-efficient log forwarding daemon designed for Kubernetes env
 - **Event-Driven File Monitoring** - Uses filesystem events for instant rotation detection
 - **Historical Log Recovery** - Reads existing log content on startup (no data loss)
 - **Symlink Support** - Full support for Kubernetes symlinked log files
+- **Modern Logging** - Uses `tracing` and `tracing_subscriber` for structured, async-aware logging with JSON and human-readable formats
 
 ## 🏗️ Architecture
 
@@ -260,7 +261,6 @@ spec:
 ```json
 {
   "log_path": "/var/log/pods",
-  "is_debug": false,
   "state_file_path": "/tmp/logfowd2_state.json",
   "read_existing_on_startup": false,
   "read_chunk_size": 200,
@@ -287,8 +287,8 @@ spec:
   },
   
   "logging": {
-    "level": "info",
-    "format": "simple"
+    "log_level": "info",
+    "log_format": "simple"
   },
   
   "es": {
@@ -317,8 +317,8 @@ spec:
 - `metrics.enabled: false` - Enable/disable Prometheus metrics
 - `metrics.port: 9090` - Port for metrics endpoint
 - `metrics.path: "/metrics"` - Path for metrics endpoint
-- `logging.level: "info"` - Log level (debug/info/warn/error)
-- `logging.format: "simple"` - Log format (simple/structured)
+- `logging.log_level: "info"` - Log level (trace/debug/info/warn/error)
+- `logging.log_format: "simple"` - Log format (simple/json)
 - `read_existing_on_startup: false|true` - If false, skip historical content and start from end (reduces startup memory spikes)
 - `read_chunk_size: 200` - Max lines per read batch; smaller values reduce peak memory
 - `max_line_size: 1048576` - Maximum bytes per log line (1MB default); prevents OOM from extremely long lines

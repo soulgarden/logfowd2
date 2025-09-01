@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use notify::event::ModifyKind::{Data, Name};
 use notify::event::RenameMode;
 use notify::{
@@ -236,7 +236,7 @@ impl Watcher {
         let mut watcher = RecommendedWatcher::new(
             move |res| {
                 if filesystem_sender.send(res).is_err() {
-                    log::debug!("NotifyBridge filesystem channel closed during shutdown");
+                    debug!("NotifyBridge filesystem channel closed during shutdown");
                 }
             },
             Config::default(),
@@ -497,7 +497,7 @@ impl Watcher {
                 }
                 // Removed 100ms polling cycle - now purely event-driven for CPU efficiency
                 _ = shutdown.notified() => {
-                    log::info!("watcher received shutdown signal");
+                    info!("watcher received shutdown signal");
 
                     return Ok(())
                 }
@@ -894,7 +894,6 @@ mod tests {
         serde_json::from_str(
             r#"
         {
-            "is_debug": true,
             "log_path": "/tmp/test_logs",
             "state_file_path": "/tmp/test_watcher_state.json",
             "es": {

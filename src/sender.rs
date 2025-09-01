@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use log::warn;
+use tracing::{info, warn};
 
 use tokio::sync::Notify;
 use tokio::time::interval;
@@ -64,7 +64,7 @@ impl Sender {
                             }
                         }
                         Ok(Err(_)) => {
-                            log::info!("Process queue closed, initiating graceful shutdown");
+                            info!("Process queue closed, initiating graceful shutdown");
                             if !batch.is_empty() {
                                 self.send_batch(&mut batch).await;
                             }
@@ -79,10 +79,10 @@ impl Sender {
 
                 // Shutdown
                 _ = shutdown.notified() => {
-                    log::info!("Sender received shutdown signal");
+                    info!("Sender received shutdown signal");
 
                     if !batch.is_empty() {
-                        log::info!("Sending remaining events before shutdown");
+                        info!("Sending remaining events before shutdown");
                         // Use timeout to avoid hanging during shutdown if ES workers are down
                         let timeout_result = tokio::time::timeout(
                             Duration::from_millis(1000),
@@ -90,9 +90,9 @@ impl Sender {
                         ).await;
 
                         match timeout_result {
-                            Ok(_) => log::info!("Finished sending remaining events"),
+                            Ok(_) => info!("Finished sending remaining events"),
                             Err(_) => {
-                                log::warn!("Timeout while sending remaining events during shutdown, continuing with shutdown");
+                                warn!("Timeout while sending remaining events during shutdown, continuing with shutdown");
                             }
                         }
                     }
@@ -207,7 +207,6 @@ mod tests {
 
     fn create_test_conf(flush_interval: u64, bulk_size: usize) -> Settings {
         Settings {
-            is_debug: true,
             log_path: "/tmp/test".to_string(),
             state_file_path: None,
             read_existing_on_startup: None,
@@ -1054,7 +1053,6 @@ mod tests {
         let _ = init_metrics();
 
         let conf = Settings {
-            is_debug: true,
             log_path: "/tmp/test".to_string(),
             state_file_path: None,
             read_existing_on_startup: None,

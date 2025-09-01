@@ -7,6 +7,8 @@ use std::fs;
 use tempfile::TempDir;
 #[cfg(test)]
 use tokio::time::{Duration, timeout};
+#[cfg(test)]
+use tracing::{debug, warn};
 
 #[cfg(test)]
 use crate::transport::channels::create_bounded_channel;
@@ -26,7 +28,6 @@ mod tests {
         serde_json::from_str(
             r#"
         {
-            "is_debug": true,
             "log_path": "/tmp/test_logs",
             "state_file_path": "/tmp/test_state.json",
             "es": {
@@ -75,7 +76,6 @@ mod tests {
 
         let config_content = r#"
         {
-            "is_debug": true,
             "log_path": "/tmp/integration_test",
             "state_file_path": "/tmp/integration_state.json",
             "channels": {
@@ -102,7 +102,6 @@ mod tests {
             serde_json::from_str(config_content).expect("Failed to parse integration test config");
 
         // Verify config was loaded correctly
-        assert!(conf.is_debug);
         assert_eq!(conf.log_path, "/tmp/integration_test");
         assert_eq!(conf.elasticsearch.host, "http://test-es");
         assert_eq!(conf.elasticsearch.bulk_size, 50);
@@ -394,7 +393,7 @@ mod tests {
                         match result {
                             Ok(events) => {
                                 // Just consume the events for testing
-                                log::debug!("Received {} events in test ES consumer", events.len());
+                                debug!("Received {} events in test ES consumer", events.len());
                             }
                             Err(_) => break, // Channel closed
                         }
@@ -425,7 +424,7 @@ mod tests {
             Ok(result) => result.expect("Sender task should complete"),
             Err(_) => {
                 // If sender doesn't shut down gracefully, that might be expected in test scenarios
-                log::warn!(
+                warn!(
                     "Sender did not shut down within timeout, which may be expected in test"
                 );
                 return;
