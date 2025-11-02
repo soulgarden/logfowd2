@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
-use tracing::{debug, error, info, warn};
 use notify::event::ModifyKind::{Data, Name};
 use notify::event::RenameMode;
 use notify::{
@@ -15,16 +14,19 @@ use regex::Regex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{Notify, RwLock};
 use tokio::time::interval;
+use tracing::{debug, error, info, warn};
 
 use crate::config::Settings;
-use crate::transport::channels::BoundedSender;
-use crate::transport::bridge::{EventBridge, EventBridgeConfig, NotifyEventSender};
 use crate::domain::event::{Event, Meta};
 use crate::domain::file::FileTracker;
-use crate::infrastructure::metrics::{are_metrics_enabled, metrics};
-use crate::infrastructure::filesystem::notify::{NotifyBridge, NotifyBridgeConfig, NotifyFilesystemSender};
 use crate::domain::state::AppState;
+use crate::infrastructure::filesystem::notify::{
+    NotifyBridge, NotifyBridgeConfig, NotifyFilesystemSender,
+};
+use crate::infrastructure::metrics::{are_metrics_enabled, metrics};
 use crate::task_pool::SmartTaskPool;
+use crate::transport::bridge::{EventBridge, EventBridgeConfig, NotifyEventSender};
+use crate::transport::channels::BoundedSender;
 
 const K8S_PODS_REGEXP: &str = r"^/var/log/pods/(?P<namespace>[a-z0-9-]+)_(?P<pod_name>[a-z0-9-]+)_(?P<pod_id>[a-z0-9-]+)/(?P<container_name>[a-z-0-9]+)/(?P<num>0|[1-9][0-9]*).log$";
 
@@ -1498,7 +1500,8 @@ mod tests {
     async fn test_directory_removal_events_are_handled_gracefully() {
         // Test that directory removal events don't cause "unknown file" warnings
         let conf = create_test_conf();
-        let channel = create_bounded_channel::<crate::domain::event::Event>(100, None, None, None, None);
+        let channel =
+            create_bounded_channel::<crate::domain::event::Event>(100, None, None, None, None);
         let sender = channel.sender();
         let watcher = Watcher::new(conf, sender);
 

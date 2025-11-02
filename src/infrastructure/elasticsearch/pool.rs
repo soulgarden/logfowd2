@@ -4,19 +4,23 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::BufMut;
 use chrono::Utc;
-use tracing::{debug, error, info, warn};
 use reqwest::Client;
 use tokio::sync::Notify;
 use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
 
 use crate::config::Settings;
-use crate::transport::channels::BoundedReceiver;
-use crate::infrastructure::elasticsearch::circuit_breaker::{CircuitBreaker, CircuitBreakerError, create_es_circuit_breaker};
-use crate::infrastructure::elasticsearch::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
-use crate::error::{EsError, Result};
 use crate::domain::event::Event;
+use crate::error::{EsError, Result};
+use crate::infrastructure::elasticsearch::circuit_breaker::{
+    CircuitBreaker, CircuitBreakerError, create_es_circuit_breaker,
+};
+use crate::infrastructure::elasticsearch::dead_letter_queue::{
+    DeadLetterQueue, DeadLetterQueueConfig,
+};
 use crate::requests::{FieldsBody, Index};
 use crate::retry::{RetryConfig, RetryManager};
+use crate::transport::channels::BoundedReceiver;
 
 pub struct EsWorkerPool {
     workers: Vec<EsWorker>,
@@ -753,7 +757,10 @@ mod tests {
     #[test]
     fn test_planned_worker_count() {
         let conf = create_test_config();
-        assert_eq!(planned_worker_count(&conf), conf.elasticsearch.workers as usize);
+        assert_eq!(
+            planned_worker_count(&conf),
+            conf.elasticsearch.workers as usize
+        );
     }
 
     #[test]
@@ -788,7 +795,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_process_events_with_di() {
-        use crate::infrastructure::elasticsearch::dead_letter_queue::{DeadLetterQueue, DeadLetterQueueConfig};
+        use crate::infrastructure::elasticsearch::dead_letter_queue::{
+            DeadLetterQueue, DeadLetterQueueConfig,
+        };
         let conf = create_test_config();
         let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig::default()));
         let http = Arc::new(NoopClient);
@@ -829,7 +838,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_worker_sends_failed_events_to_dlq() {
-        use crate::infrastructure::elasticsearch::dead_letter_queue::{DeadLetter, DeadLetterQueue, DeadLetterQueueConfig};
+        use crate::infrastructure::elasticsearch::dead_letter_queue::{
+            DeadLetter, DeadLetterQueue, DeadLetterQueueConfig,
+        };
         use tempfile::NamedTempFile;
 
         let conf = create_test_config();

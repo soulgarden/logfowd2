@@ -1,30 +1,30 @@
-use tracing::{debug, error, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tracing::{debug, error, warn};
 
-use crate::transport::channels::BoundedSender;
 use crate::domain::event::Event;
 use crate::domain::file::FileTracker;
 use crate::domain::state::AppState;
+use crate::transport::channels::BoundedSender;
 
 /// Smart TaskPool with dynamic scaling and memory optimization
-/// 
+///
 /// This component is designed for future integration with the Watcher to enable
-/// parallel file reading, which would significantly improve performance when 
-/// processing many log files concurrently. The configuration field 
+/// parallel file reading, which would significantly improve performance when
+/// processing many log files concurrently. The configuration field
 /// `max_concurrent_file_readers` is already validated in config and can control
 /// the pool size (2-10 workers with dynamic scaling).
-/// 
+///
 /// Benefits when integrated:
 /// - Parallel processing of multiple log files
 /// - Dynamic worker scaling based on load
 /// - Memory optimization through bounded concurrency
 /// - Automatic idle worker timeout (30s) to free resources
-/// 
+///
 /// TODO: Integrate into Watcher for parallel file processing
 // Kept for future parallel file processing optimization
 #[allow(dead_code)]

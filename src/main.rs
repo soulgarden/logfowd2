@@ -6,7 +6,7 @@ extern crate core;
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::config::Settings;
 use crate::error::{AppError, Result};

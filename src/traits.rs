@@ -1,6 +1,6 @@
+use crate::domain::event::Event;
 use anyhow::Result;
 use async_trait::async_trait;
-use crate::domain::event::Event;
 
 #[async_trait]
 #[allow(dead_code)]

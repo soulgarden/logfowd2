@@ -1,12 +1,12 @@
-use tracing::{debug, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tracing::{debug, warn};
 
-use crate::transport::channels::{BoundedSender, SendError};
 use crate::domain::event::Event;
 use crate::infrastructure::metrics::metrics;
+use crate::transport::channels::{BoundedSender, SendError};
 
 /// EventBridge provides a two-tier channel architecture to prevent notify callback blocking.
 /// It uses an unbounded channel for the notify callback and bridges to a bounded channel
@@ -143,7 +143,7 @@ impl EventBridge {
                             match bounded_sender.send(event).await {
                                 Ok(()) => {
                                     events_forwarded += 1;
-                                    if metrics_enabled && events_forwarded % 1000 == 0 {
+                                    if metrics_enabled && events_forwarded.is_multiple_of(1000) {
                                         metrics()
                                             .events_processed_total
                                             .with_label_values(&["event_bridge", "forwarded"])
@@ -288,8 +288,8 @@ impl std::error::Error for NotifyEventSendError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::channels::create_bounded_channel;
     use crate::domain::event::{Event, Meta};
+    use crate::transport::channels::create_bounded_channel;
     use std::time::Duration;
     use tokio::time;
 
