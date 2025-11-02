@@ -720,7 +720,6 @@ impl FileTracker {
         sanitized.to_string()
     }
 
-
     /// Handle file access errors with specific logic for permission denied
     fn handle_file_access_error<T>(path: &str, error: std::io::Error) -> Result<T, std::io::Error> {
         match error.kind() {

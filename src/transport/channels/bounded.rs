@@ -1,7 +1,7 @@
 use async_channel::{Receiver, Sender};
-use tracing::{debug, warn};
 use std::time::{Duration, Instant};
 use tokio::time;
+use tracing::{debug, warn};
 
 pub struct BoundedChannel<T> {
     sender: Sender<T>,

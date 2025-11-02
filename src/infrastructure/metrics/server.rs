@@ -3,10 +3,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use tracing::{error, info};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use tower::ServiceBuilder;
+use tracing::{error, info};
 
 use crate::config::MetricsConfig;
 use crate::infrastructure::metrics::metrics;
@@ -159,10 +159,7 @@ mod tests {
 
         // Verify that unwrap_or(false) in metrics_server matches this behavior
         assert_eq!(
-            config_enabled_none
-                .as_ref()
-                .unwrap()
-                .enabled,
+            config_enabled_none.as_ref().unwrap().enabled,
             false,
             "metrics_server should also default to false when enabled is false"
         );

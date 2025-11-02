@@ -1,8 +1,8 @@
-use tracing::{debug, warn};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tracing::{debug, warn};
 
 use crate::infrastructure::metrics::metrics;
 
@@ -156,7 +156,7 @@ impl NotifyBridge {
                             match bounded_sender.try_send(event) {
                                 Ok(()) => {
                                     events_forwarded += 1;
-                                    if metrics_enabled && events_forwarded % 1000 == 0 {
+                                    if metrics_enabled && events_forwarded.is_multiple_of(1000) {
                                         metrics()
                                             .notify_filesystem_events_forwarded
                                             .with_label_values(&["notify_bridge", "forwarded"])

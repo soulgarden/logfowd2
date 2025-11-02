@@ -1,6 +1,6 @@
-FROM rust:1.89-alpine AS builder
+FROM rust:1.91-alpine AS builder
 
-RUN apk add --no-cache musl-dev pkgconfig && \
+RUN apk add --no-cache musl-dev pkgconfig gcc make && \
     rustup target add x86_64-unknown-linux-musl
 
 COPY . /tmp/rust/src/github.com/soulgarden/logfowd2

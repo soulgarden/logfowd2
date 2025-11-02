@@ -1,6 +1,6 @@
-use tracing::{debug, warn};
 use std::time::Duration;
 use tokio::time::sleep;
+use tracing::{debug, warn};
 
 #[derive(Debug, Clone)]
 pub struct RetryConfig {

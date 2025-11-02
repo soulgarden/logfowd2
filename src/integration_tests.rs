@@ -11,11 +11,11 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, warn};
 
 #[cfg(test)]
-use crate::transport::channels::create_bounded_channel;
-#[cfg(test)]
 use crate::config::Settings;
 #[cfg(test)]
 use crate::domain::event::{Event, Meta};
+#[cfg(test)]
+use crate::transport::channels::create_bounded_channel;
 #[cfg(test)]
 use crate::watcher::Watcher;
 
@@ -313,8 +313,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_sender_to_es_workers_integration() {
-        use crate::transport::channels::BoundedChannel;
         use crate::domain::event::Event;
+        use crate::transport::channels::BoundedChannel;
 
         // Create channels for sender -> ES workers communication
         let es_channel: BoundedChannel<Vec<Event>> =
@@ -424,9 +424,7 @@ mod tests {
             Ok(result) => result.expect("Sender task should complete"),
             Err(_) => {
                 // If sender doesn't shut down gracefully, that might be expected in test scenarios
-                warn!(
-                    "Sender did not shut down within timeout, which may be expected in test"
-                );
+                warn!("Sender did not shut down within timeout, which may be expected in test");
                 return;
             }
         };

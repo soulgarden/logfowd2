@@ -8,11 +8,11 @@ use tokio::sync::Notify;
 use tokio::time::interval;
 
 use crate::config::Settings;
-use crate::transport::channels::{BoundedReceiver, BoundedSender};
-use crate::error::Result;
 use crate::domain::event::Event;
+use crate::error::Result;
 use crate::infrastructure::metrics::{are_metrics_enabled, metrics};
 use crate::traits::EventProcessor;
+use crate::transport::channels::{BoundedReceiver, BoundedSender};
 
 pub struct Sender {
     conf: Settings,
@@ -38,7 +38,9 @@ impl Sender {
     }
 
     pub async fn run(&mut self, shutdown: Arc<Notify>) -> Result<()> {
-        let mut ticker = interval(Duration::from_millis(self.conf.elasticsearch.flush_interval));
+        let mut ticker = interval(Duration::from_millis(
+            self.conf.elasticsearch.flush_interval,
+        ));
         ticker.tick().await; // Skip the immediate first tick
 
         let mut batch = Vec::new();
@@ -186,7 +188,7 @@ impl EventProcessor for Sender {
         self.send_batch(&mut batch).await;
         Ok(())
     }
-    
+
     fn can_process(&self) -> bool {
         // Sender can process if the ES queue is not full
         // In the current implementation, we always return true as the sender
@@ -198,9 +200,9 @@ impl EventProcessor for Sender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::channels::BoundedChannel;
-    use crate::config::settings::{Settings, ElasticsearchConfig};
+    use crate::config::settings::{ElasticsearchConfig, Settings};
     use crate::domain::event::{Event, Meta};
+    use crate::transport::channels::BoundedChannel;
     use std::sync::Arc;
     use tokio::sync::Notify;
     use tokio::time::{Duration, sleep, timeout};
@@ -627,8 +629,14 @@ mod tests {
                 es_channel.sender(),
             );
 
-            assert_eq!(sender.conf.elasticsearch.flush_interval, conf.elasticsearch.flush_interval);
-            assert_eq!(sender.conf.elasticsearch.bulk_size, conf.elasticsearch.bulk_size);
+            assert_eq!(
+                sender.conf.elasticsearch.flush_interval,
+                conf.elasticsearch.flush_interval
+            );
+            assert_eq!(
+                sender.conf.elasticsearch.bulk_size,
+                conf.elasticsearch.bulk_size
+            );
         }
     }
 
