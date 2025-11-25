@@ -25,8 +25,8 @@ use crate::transport::channels::BoundedReceiver;
 pub struct EsWorkerPool {
     workers: Vec<EsWorker>,
     es_queue_receiver: BoundedReceiver<Vec<Event>>,
-    #[allow(dead_code)] // Shared reference to DLQ, used by workers
     dead_letter_queue: Arc<DeadLetterQueue>,
+    conf: Settings,
 }
 
 struct EsWorker {
@@ -351,6 +351,121 @@ impl EsWorkerPool {
             workers,
             es_queue_receiver,
             dead_letter_queue,
+            conf,
+        })
+    }
+
+    /// Start a background task that periodically retries events from DLQ
+    fn start_dlq_retry_task(
+        dlq: Arc<DeadLetterQueue>,
+        conf: Settings,
+        shutdown_notify: Arc<Notify>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // Create HTTP client for retry
+            let client = match Client::builder()
+                .pool_max_idle_per_host(5)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(30))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to create HTTP client for DLQ retry: {}", e);
+                    return;
+                }
+            };
+
+            let es_url = format!(
+                "{}:{}/{}/_bulk",
+                conf.elasticsearch.host, conf.elasticsearch.port, conf.elasticsearch.index_name
+            );
+
+            let mut retry_interval = Duration::from_secs(30);
+            let max_interval = Duration::from_secs(300); // 5 min max
+            let batch_size = 100;
+
+            info!("DLQ retry task started (interval: {:?})", retry_interval);
+
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_interval) => {
+                        // Take a batch from DLQ
+                        let batch = dlq.take_batch(batch_size).await;
+                        if batch.is_empty() {
+                            // Reset interval when queue is empty
+                            retry_interval = Duration::from_secs(30);
+                            continue;
+                        }
+
+                        info!("DLQ retry: attempting to send {} events", batch.len());
+
+                        // Convert DeadLetters back to Events
+                        let events: Vec<Event> = batch.iter().map(|dl| dl.event.clone()).collect();
+                        let event_count = events.len();
+
+                        // Build bulk request body
+                        let mut body = Vec::new();
+                        for event in &events {
+                            let index = Index::new();
+                            let fields = FieldsBody::new(
+                                event.message.clone(),
+                                event.timestamp,
+                                event.meta.pod_name.clone(),
+                                event.meta.namespace.clone(),
+                                event.meta.container_name.clone(),
+                                event.meta.pod_id.clone(),
+                            );
+
+                            if let Ok(index_json) = serde_json::to_string(&index) {
+                                body.put(index_json.as_bytes());
+                                body.put_u8(b'\n');
+                            }
+                            if let Ok(fields_json) = serde_json::to_string(&fields) {
+                                body.put(fields_json.as_bytes());
+                                body.put_u8(b'\n');
+                            }
+                        }
+
+                        // Send to ES
+                        match timeout(
+                            Duration::from_secs(30),
+                            client
+                                .post(&es_url)
+                                .header("Content-Type", "application/x-ndjson")
+                                .body(body)
+                                .send()
+                        ).await {
+                            Ok(Ok(response)) if response.status().is_success() => {
+                                info!("DLQ retry: successfully sent {} events", event_count);
+                                dlq.mark_recovered(event_count).await;
+                                retry_interval = Duration::from_secs(30); // Reset on success
+                            }
+                            Ok(Ok(response)) => {
+                                warn!("DLQ retry: ES returned error status {}", response.status());
+                                dlq.return_failed(batch).await;
+                                retry_interval = (retry_interval * 2).min(max_interval);
+                            }
+                            Ok(Err(e)) => {
+                                warn!("DLQ retry: request failed: {}", e);
+                                dlq.return_failed(batch).await;
+                                retry_interval = (retry_interval * 2).min(max_interval);
+                            }
+                            Err(_) => {
+                                warn!("DLQ retry: request timed out");
+                                dlq.return_failed(batch).await;
+                                retry_interval = (retry_interval * 2).min(max_interval);
+                            }
+                        }
+                    }
+                    _ = shutdown_notify.notified() => {
+                        info!("DLQ retry task received shutdown signal");
+                        break;
+                    }
+                }
+            }
+
+            info!("DLQ retry task shutdown complete");
         })
     }
 
@@ -358,10 +473,17 @@ impl EsWorkerPool {
         let worker_count = self.workers.len(); // Capture worker count before draining
 
         // Start DLQ background tasks with shutdown coordination
-        let _dlq_handle = self
+        let _dlq_flush_handle = self
             .dead_letter_queue
             .start_background_tasks(shutdown_notify.clone())
             .await;
+
+        // Start DLQ retry task
+        let _dlq_retry_handle = Self::start_dlq_retry_task(
+            Arc::clone(&self.dead_letter_queue),
+            self.conf.clone(),
+            shutdown_notify.clone(),
+        );
 
         info!("Starting ES worker pool with {} workers", worker_count);
 
@@ -852,6 +974,7 @@ mod tests {
             max_queue_size: 100,
             persistence_file: Some(dlq_path.clone()),
             flush_interval: std::time::Duration::from_secs(60),
+            max_retry_count: 5,
         });
 
         let http = std::sync::Arc::new(FailingClient);

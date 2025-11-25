@@ -84,18 +84,16 @@ impl Sender {
                     info!("Sender received shutdown signal");
 
                     if !batch.is_empty() {
-                        info!("Sending remaining events before shutdown");
-                        // Use timeout to avoid hanging during shutdown if ES workers are down
-                        let timeout_result = tokio::time::timeout(
-                            Duration::from_millis(1000),
-                            self.send_batch(&mut batch)
-                        ).await;
+                        info!("Sending {} remaining events before shutdown", batch.len());
+                        // Use send_batch directly - it has built-in retry with backoff
+                        // (50 attempts × 100ms = 5 seconds max wait)
+                        // This ensures events are not lost during graceful shutdown
+                        self.send_batch(&mut batch).await;
 
-                        match timeout_result {
-                            Ok(_) => info!("Finished sending remaining events"),
-                            Err(_) => {
-                                warn!("Timeout while sending remaining events during shutdown, continuing with shutdown");
-                            }
+                        if batch.is_empty() {
+                            info!("Finished sending remaining events");
+                        } else {
+                            warn!("Could not deliver {} events during shutdown (ES unavailable)", batch.len());
                         }
                     }
 
@@ -115,20 +113,30 @@ impl Sender {
         if self.conf.elasticsearch.bulk_size == 0 {
             // Send all events at once
             let events = std::mem::take(batch);
-            self.send_events_to_es(events).await;
+            if let Some(failed_events) = self.send_events_to_es(events).await {
+                // Put failed events back at the beginning for retry on next flush
+                batch.splice(0..0, failed_events);
+            }
         } else {
             // Send events in bulk_size chunks
             while !batch.is_empty() {
                 let chunk_size = std::cmp::min(batch.len(), self.conf.elasticsearch.bulk_size);
                 let events = batch.drain(..chunk_size).collect();
-                self.send_events_to_es(events).await;
+                if let Some(failed_events) = self.send_events_to_es(events).await {
+                    // Put failed events back at the beginning for retry on next flush
+                    batch.splice(0..0, failed_events);
+                    // Stop processing more chunks - will retry on next flush cycle
+                    break;
+                }
             }
         }
     }
 
-    async fn send_events_to_es(&mut self, events: Vec<Event>) {
+    /// Send events to ES workers using try_send with retry loop.
+    /// Returns None on success, Some(events) on failure (events not lost).
+    async fn send_events_to_es(&mut self, mut events: Vec<Event>) -> Option<Vec<Event>> {
         if events.is_empty() {
-            return;
+            return None;
         }
 
         let event_count = events.len() as u64;
@@ -141,41 +149,54 @@ impl Sender {
                 .observe(event_count as f64);
         }
 
-        // Use timeout to prevent hanging if ES workers are unavailable
-        let send_result = tokio::time::timeout(
-            Duration::from_millis(5000),
-            self.es_queue_sender.send(events),
-        )
-        .await;
-
-        match send_result {
-            Ok(Ok(())) => {
-                if self.metrics_enabled {
-                    metrics()
-                        .events_processed_total
-                        .with_label_values(&["sender", "success"])
-                        .inc_by(event_count);
+        // Retry loop with try_send - events are never lost
+        let max_attempts = 50; // 50 * 100ms = 5 seconds total
+        for attempt in 0..max_attempts {
+            match self.es_queue_sender.try_send(events) {
+                Ok(()) => {
+                    // Success
+                    if self.metrics_enabled {
+                        metrics()
+                            .events_processed_total
+                            .with_label_values(&["sender", "success"])
+                            .inc_by(event_count);
+                    }
+                    return None;
                 }
-            }
-            Ok(Err(e)) => {
-                warn!("Failed to send batch to ES workers: {:?}", e);
-                if self.metrics_enabled {
-                    metrics()
-                        .errors_total
-                        .with_label_values(&["sender", "send_failed"])
-                        .inc();
+                Err(crate::transport::channels::SendError::Full(returned_events)) => {
+                    // Channel full - retry after delay
+                    events = returned_events;
+                    if attempt < max_attempts - 1 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
-            }
-            Err(_) => {
-                warn!("Timeout while sending batch to ES workers, events may be lost");
-                if self.metrics_enabled {
-                    metrics()
-                        .errors_total
-                        .with_label_values(&["sender", "timeout"])
-                        .inc();
+                Err(crate::transport::channels::SendError::Closed(returned_events)) => {
+                    // Channel closed - return events for later retry
+                    warn!("ES channel closed, {} events will be retried", returned_events.len());
+                    if self.metrics_enabled {
+                        metrics()
+                            .errors_total
+                            .with_label_values(&["sender", "channel_closed"])
+                            .inc();
+                    }
+                    return Some(returned_events);
                 }
             }
         }
+
+        // Exhausted retries - return events for retry on next flush cycle
+        warn!(
+            "Failed to send {} events after {} attempts, will retry on next flush",
+            events.len(),
+            max_attempts
+        );
+        if self.metrics_enabled {
+            metrics()
+                .errors_total
+                .with_label_values(&["sender", "retry_exhausted"])
+                .inc();
+        }
+        Some(events)
     }
 }
 
@@ -1136,6 +1157,276 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_events_not_lost_on_full_es_channel() {
+        // TDD: This test verifies that events are NOT lost when ES channel is full
+        // Test scenario: ES channel is full, sender should retry until space available
+        let conf = create_test_conf(10000, 5); // Long timer, bulk_size=5
+        let process_channel: BoundedChannel<Event> = BoundedChannel::new(20, None);
+        let es_channel: BoundedChannel<Vec<Event>> = BoundedChannel::new(1, None); // Capacity=1 to simulate slow ES
+
+        let mut process_sender = process_channel.sender();
+        let es_receiver = es_channel.receiver();
+
+        let mut sender = Sender::new(conf, process_channel.receiver(), es_channel.sender());
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = shutdown.clone();
+
+        let sender_handle = tokio::spawn(async move { sender.run(shutdown_clone).await });
+
+        // Send 10 events (2 batches of 5)
+        for i in 0..10 {
+            process_sender
+                .send(create_test_event(&format!("important_msg_{}", i)))
+                .await
+                .unwrap();
+        }
+
+        // Give time for first batch to be sent (ES channel capacity=1, will block second batch)
+        sleep(Duration::from_millis(100)).await;
+
+        // Read first batch to unblock
+        let batch1 = timeout(Duration::from_millis(100), es_receiver.recv())
+            .await
+            .expect("Should receive first batch")
+            .unwrap();
+        assert_eq!(batch1.len(), 5, "First batch should have 5 events");
+
+        // Give time for second batch to be processed
+        sleep(Duration::from_millis(100)).await;
+
+        // Read second batch
+        let batch2 = timeout(Duration::from_millis(100), es_receiver.recv())
+            .await
+            .expect("Should receive second batch - events must NOT be lost!")
+            .unwrap();
+        assert_eq!(batch2.len(), 5, "Second batch should have 5 events - none lost!");
+
+        // Verify total events
+        let total_events = batch1.len() + batch2.len();
+        assert_eq!(total_events, 10, "All 10 events must be delivered, none lost!");
+
+        shutdown.notify_one();
+        let _ = timeout(Duration::from_millis(500), sender_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_try_send_returns_events_on_full_channel() {
+        // TDD: Test that try_send returns events when channel is full (not loses them)
+        use crate::transport::channels::SendError;
+
+        let es_channel: BoundedChannel<Vec<Event>> = BoundedChannel::new(1, None);
+        let mut es_sender = es_channel.sender();
+        let _es_receiver = es_channel.receiver(); // Keep receiver alive
+
+        // Fill the channel
+        let batch1 = vec![create_test_event("first")];
+        es_sender.send(batch1).await.unwrap();
+
+        // Now channel is full - try_send should return the events, not lose them
+        let batch2 = vec![
+            create_test_event("second_1"),
+            create_test_event("second_2"),
+        ];
+
+        // This should fail with Full error and return our events
+        let result = es_sender.try_send(batch2);
+
+        match result {
+            Err(SendError::Full(returned_events)) => {
+                assert_eq!(returned_events.len(), 2, "Events must be returned, not lost!");
+                assert_eq!(returned_events[0].message, "second_1");
+                assert_eq!(returned_events[1].message, "second_2");
+            }
+            Ok(()) => panic!("Should have failed with Full error, not succeeded"),
+            Err(SendError::Closed(_)) => panic!("Channel should not be closed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_delivers_events_with_slow_es_channel() {
+        // TDD: Test that shutdown waits for events to be delivered even when ES channel is slow
+        // This verifies fix for problem #2: shutdown timeout too short
+        let conf = create_test_conf(10000, 5); // Long timer, bulk_size=5
+        let process_channel: BoundedChannel<Event> = BoundedChannel::new(20, None);
+        let es_channel: BoundedChannel<Vec<Event>> = BoundedChannel::new(1, None); // Capacity=1 - slow ES
+
+        let mut process_sender = process_channel.sender();
+        let es_receiver = es_channel.receiver();
+
+        let mut sender = Sender::new(conf, process_channel.receiver(), es_channel.sender());
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = shutdown.clone();
+
+        let sender_handle = tokio::spawn(async move { sender.run(shutdown_clone).await });
+
+        // Send 10 events (2 batches of 5)
+        for i in 0..10 {
+            process_sender
+                .send(create_test_event(&format!("shutdown_test_{}", i)))
+                .await
+                .unwrap();
+        }
+
+        // Wait for first batch to be sent
+        sleep(Duration::from_millis(50)).await;
+
+        // Trigger shutdown - there should still be events pending
+        shutdown.notify_one();
+
+        // Now read all events - should get ALL 10 despite shutdown
+        let mut total_received = 0;
+
+        // Read batches until sender completes
+        let sender_result = timeout(Duration::from_secs(6), async {
+            loop {
+                match timeout(Duration::from_millis(500), es_receiver.recv()).await {
+                    Ok(Ok(batch)) => {
+                        total_received += batch.len();
+                        if total_received >= 10 {
+                            break;
+                        }
+                    }
+                    Ok(Err(_)) => break, // Channel closed
+                    Err(_) => break,     // Timeout
+                }
+            }
+        })
+        .await;
+
+        assert!(sender_result.is_ok(), "Sender should complete within timeout");
+
+        // Wait for sender to finish
+        let _ = timeout(Duration::from_secs(1), sender_handle).await;
+
+        assert_eq!(
+            total_received, 10,
+            "All 10 events must be delivered during shutdown, got {}",
+            total_received
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_waits_for_retry_to_complete() {
+        // TDD: Verify that shutdown uses the full retry mechanism from send_events_to_es
+        // rather than the 1-second external timeout
+        //
+        // Key insight: The 1-second timeout applies ONLY to events in `batch` at shutdown time
+        // NOT to events that already triggered bulk flush during normal operation.
+        //
+        // Scenario:
+        // 1. Pre-fill ES channel (capacity=1) with blocker
+        // 2. Send 3 events (bulk_size=10, so they stay in batch)
+        // 3. Trigger shutdown - events are in batch, send_batch called with 1-second timeout
+        // 4. Wait 1.5 seconds (more than timeout), then drain
+        // 5. With old code: events lost. With fix: events delivered.
+        let conf = create_test_conf(10000, 10); // Long timer, bulk_size=10 (won't trigger)
+        let process_channel: BoundedChannel<Event> = BoundedChannel::new(20, None);
+        let es_channel: BoundedChannel<Vec<Event>> = BoundedChannel::new(1, None); // capacity=1
+
+        let mut process_sender = process_channel.sender();
+        let es_receiver = es_channel.receiver();
+        let mut es_sender_direct = es_channel.sender();
+
+        // Pre-fill ES channel with a dummy batch to block it
+        es_sender_direct
+            .send(vec![create_test_event("blocker")])
+            .await
+            .unwrap();
+
+        let mut sender = Sender::new(conf, process_channel.receiver(), es_channel.sender());
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = shutdown.clone();
+
+        let sender_handle = tokio::spawn(async move { sender.run(shutdown_clone).await });
+
+        // Send 3 events - less than bulk_size=10, so they stay in batch
+        for i in 0..3 {
+            process_sender
+                .send(create_test_event(&format!("shutdown_retry_{}", i)))
+                .await
+                .unwrap();
+        }
+
+        // Give time for events to be received into batch
+        sleep(Duration::from_millis(50)).await;
+
+        // Trigger shutdown - events are in batch, will call send_batch with external timeout
+        shutdown.notify_one();
+
+        // Wait 1.5 seconds - more than old 1-second timeout
+        // With old code, the timeout fires and events are lost
+        sleep(Duration::from_millis(1500)).await;
+
+        // Now drain ES channel - if retry is still running, events will come through
+        let mut total_received = 0;
+
+        // Drain all batches
+        while let Ok(Ok(batch)) = timeout(Duration::from_millis(2000), es_receiver.recv()).await {
+            // Skip the blocker batch
+            if batch.len() == 1 && batch[0].message == "blocker" {
+                continue;
+            }
+            total_received += batch.len();
+            if total_received >= 3 {
+                break;
+            }
+        }
+
+        // Wait for sender to finish
+        let _ = timeout(Duration::from_secs(2), sender_handle).await;
+
+        // With proper retry (no 1-second timeout), we should get all 3 events
+        // With old 1-second timeout, events would be lost
+        assert_eq!(
+            total_received, 3,
+            "Should receive all 3 events - retry should wait beyond 1 second. Got {}",
+            total_received
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_completes_when_channel_closed() {
+        // TDD: Test that sender completes gracefully when ES channel is closed
+        let conf = create_test_conf(10000, 5);
+        let process_channel: BoundedChannel<Event> = BoundedChannel::new(20, None);
+        let es_channel: BoundedChannel<Vec<Event>> = BoundedChannel::new(1, None);
+
+        let mut process_sender = process_channel.sender();
+        let es_receiver = es_channel.receiver();
+
+        let mut sender = Sender::new(conf, process_channel.receiver(), es_channel.sender());
+
+        let shutdown = Arc::new(Notify::new());
+        let shutdown_clone = shutdown.clone();
+
+        let sender_handle = tokio::spawn(async move { sender.run(shutdown_clone).await });
+
+        // Send 5 events (1 batch)
+        for i in 0..5 {
+            process_sender
+                .send(create_test_event(&format!("undelivered_{}", i)))
+                .await
+                .unwrap();
+        }
+
+        // Wait for events to be buffered
+        sleep(Duration::from_millis(50)).await;
+
+        // Drop receiver BEFORE shutdown to simulate ES being unavailable
+        drop(es_receiver);
+
+        // Trigger shutdown
+        shutdown.notify_one();
+
+        // Sender should complete (not hang forever) - within retry timeout
+        let result = timeout(Duration::from_secs(6), sender_handle).await;
+        assert!(result.is_ok(), "Sender should not hang when ES channel is closed");
     }
 
     #[tokio::test]
