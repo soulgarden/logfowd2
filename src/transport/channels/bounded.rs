@@ -142,6 +142,16 @@ impl<T> BoundedSender<T> {
         }
     }
 
+    /// Try to send an item without blocking.
+    /// Returns the item back if the channel is full or closed.
+    pub fn try_send(&mut self, item: T) -> Result<(), SendError<T>> {
+        match self.sender.try_send(item) {
+            Ok(()) => Ok(()),
+            Err(async_channel::TrySendError::Full(item)) => Err(SendError::Full(item)),
+            Err(async_channel::TrySendError::Closed(item)) => Err(SendError::Closed(item)),
+        }
+    }
+
     pub fn is_under_backpressure(&self) -> bool {
         // Special case: if threshold is 0.0, never trigger backpressure
         // This prevents the bug where negative thresholds (clamped to 0.0) would
@@ -249,12 +259,14 @@ impl<T> Clone for BoundedReceiver<T> {
 #[derive(Debug)]
 pub enum SendError<T> {
     Closed(T),
+    Full(T),
 }
 
 impl<T> std::fmt::Display for SendError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SendError::Closed(_) => write!(f, "Channel closed"),
+            SendError::Full(_) => write!(f, "Channel full"),
         }
     }
 }

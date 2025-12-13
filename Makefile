@@ -59,7 +59,7 @@ docker_down dd:
 	docker-compose down
 
 # Build and push Docker image with version from VERSION file
-docker-build db: increment-version
+docker-build db:
 	@NEW_VERSION=$$(cat VERSION); \
 	echo "Building with version: $$NEW_VERSION"; \
 	docker build . -t soulgarden/logfowd2:$$NEW_VERSION -t soulgarden/logfowd2:latest --platform linux/amd64; \

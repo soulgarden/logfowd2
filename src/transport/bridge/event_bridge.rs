@@ -154,6 +154,10 @@ impl EventBridge {
                                     debug!("Bounded channel closed, stopping EventBridge");
                                     break;
                                 }
+                                Err(SendError::Full(_)) => {
+                                    // This shouldn't happen with async send(), but handle for completeness
+                                    warn!("EventBridge: bounded channel unexpectedly full");
+                                }
                             }
                         }
                         None => {

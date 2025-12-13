@@ -1,8 +1,8 @@
 # logfowd2
 
 ![Tests and linters](https://github.com/soulgarden/logfowd2/actions/workflows/main.yml/badge.svg)
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/soulgarden/logfowd2)
-[![Tests](https://img.shields.io/badge/tests-269%20passing-success.svg)](https://github.com/soulgarden/logfowd2)
+[![Version](https://img.shields.io/badge/version-0.4.0-blue.svg)](https://github.com/soulgarden/logfowd2)
+[![Tests](https://img.shields.io/badge/tests-293%20passing-success.svg)](https://github.com/soulgarden/logfowd2)
 [![Code Quality](https://img.shields.io/badge/linter-zero%20warnings-success.svg)](https://github.com/soulgarden/logfowd2)
 
 **High-performance Kubernetes log forwarding tool built with Rust**
@@ -28,7 +28,7 @@ Logfowd2 is a memory-efficient log forwarding daemon designed for Kubernetes env
 ### Advanced System Optimization
 - **MetadataCache System** - High-performance file metadata caching with TTL-based eviction (100ms TTL, LRU)
 - **Intelligent Retry Management** - Universal exponential backoff retry mechanism for all async operations
-- **Lock Optimization** - Drop/reacquire pattern minimizes lock contention and improves concurrency
+- **Atomic Event Handling** - Collect-Then-Send pattern eliminates race conditions in file event processing
 - **Event-Driven File Monitoring** - Uses filesystem events for instant rotation detection
 - **Historical Log Recovery** - Reads existing log content on startup (no data loss)
 - **Symlink Support** - Full support for Kubernetes symlinked log files
@@ -40,7 +40,7 @@ Logfowd2 is a memory-efficient log forwarding daemon designed for Kubernetes env
 
 logfowd2 is built with Domain-Driven Design (DDD) principles:
 - **Modular design** - Clear separation between domain, infrastructure, and transport layers
-- **Comprehensive testing** - 269 tests covering all critical paths
+- **Comprehensive testing** - 293 tests covering all critical paths
 - **Type safety** - Leverages Rust's type system for compile-time guarantees
 - **Extensible architecture** - Ready for parallel file processing and custom extensions
 
@@ -81,6 +81,7 @@ Buffer Management                     State Persist                    RetryMana
 #### Watcher (`src/watcher.rs`)
 - **Purpose**: Monitors `/var/log/pods` recursively using filesystem events
 - **NotifyBridge Integration**: Uses NotifyBridge to prevent filesystem notify callback blocking
+- **Atomic Event Handling**: Collect-Then-Send pattern via `handle_create_event`/`handle_remove_event` eliminates race conditions
 - **File Tracking**: Advanced FileTracker with symlink and rapid rotation support, leveraging MetadataCache
 - **Metadata Parsing**: Extracts Kubernetes metadata (namespace, pod, container) from log paths
 - **Initial Sync**: Processes existing files on startup with position restoration
@@ -140,7 +141,7 @@ Buffer Management                     State Persist                    RetryMana
 - **Parallel ES Workers**: Concurrent bulk operations with configurable pool sizing
 - **Adaptive Batching**: Size and time-based flushing with backpressure awareness
 - **Memory Streaming**: Bounded buffer architecture prevents memory growth
-- **Advanced Lock Optimization**: Drop/reacquire pattern minimizes lock contention during I/O operations
+- **Atomic Event Handling**: Collect-Then-Send pattern eliminates race conditions while maintaining high throughput
 
 ### Resource Efficiency  
 - **Ultra-Low Memory Baseline**: 30-50Mi baseline memory usage
@@ -164,7 +165,7 @@ Buffer Management                     State Persist                    RetryMana
 ## 🧪 Code Quality & Testing
 
 ### Test Coverage
-- **263 Comprehensive Tests**: Unit, integration, and edge case coverage
+- **293 Comprehensive Tests**: Unit, integration, and edge case coverage
 - **Domain Testing**: File rotation, symlinks, corrupted files, permission issues
 - **Network Testing**: Circuit breaker, retry logic, timeout behavior
 - **Memory Testing**: Backpressure, channel overflow, cache eviction
@@ -181,7 +182,7 @@ Buffer Management                     State Persist                    RetryMana
 
 ### Prerequisites
 - **Platform**: Linux/Unix only (uses `std::os::unix` APIs and Unix signals)
-- **Rust Toolchain**: 1.85+ (required for Rust 2024 edition support)
+- **Rust Toolchain**: 1.91+ (required for Rust 2024 edition support)
 - **Kubernetes**: 1.14+ with `/var/log/pods` access
 - **Elasticsearch**: 7.x+ or ZincSearch compatible target
 

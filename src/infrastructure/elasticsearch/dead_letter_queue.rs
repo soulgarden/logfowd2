@@ -24,6 +24,8 @@ pub struct DeadLetterQueueConfig {
     pub max_queue_size: usize,
     pub persistence_file: Option<String>,
     pub flush_interval: Duration,
+    /// Maximum number of retry attempts before marking event as permanently failed
+    pub max_retry_count: usize,
 }
 
 impl Default for DeadLetterQueueConfig {
@@ -32,6 +34,7 @@ impl Default for DeadLetterQueueConfig {
             max_queue_size: 10000,
             persistence_file: Some("/tmp/logfowd2_dead_letters.json".to_string()),
             flush_interval: Duration::from_secs(60), // 1 minute
+            max_retry_count: 5,                      // 5 retry attempts
         }
     }
 }
@@ -99,6 +102,90 @@ impl DeadLetterQueue {
             failure_reason_for_log,
             queue.len()
         );
+    }
+
+    /// Take a batch of events from the front of the queue for retry.
+    /// Returns up to `limit` events, removing them from the queue.
+    /// Events are returned in FIFO order (oldest first).
+    pub async fn take_batch(&self, limit: usize) -> Vec<DeadLetter> {
+        let mut queue = self.queue.write().await;
+        let mut stats = self.stats.write().await;
+
+        let take_count = std::cmp::min(limit, queue.len());
+        let mut batch = Vec::with_capacity(take_count);
+
+        for _ in 0..take_count {
+            if let Some(dead_letter) = queue.pop_front() {
+                batch.push(dead_letter);
+            }
+        }
+
+        // Update stats
+        stats.events_in_queue = queue.len();
+        stats.events_retried += batch.len();
+
+        if !batch.is_empty() {
+            debug!(
+                "Took {} events from DLQ for retry (remaining: {})",
+                batch.len(),
+                queue.len()
+            );
+        }
+
+        batch
+    }
+
+    /// Return failed events back to the queue after unsuccessful retry.
+    /// Increments retry_count for each event and puts them at the FRONT of the queue.
+    /// Events that exceed max_retry_count are moved to permanent failure instead.
+    pub async fn return_failed(&self, events: Vec<DeadLetter>) {
+        if events.is_empty() {
+            return;
+        }
+
+        let mut queue = self.queue.write().await;
+        let mut stats = self.stats.write().await;
+
+        let mut returned_count = 0;
+        let mut permanently_failed_count = 0;
+
+        // Insert events at the front (in reverse order to maintain original order)
+        for mut dead_letter in events.into_iter().rev() {
+            dead_letter.retry_count += 1;
+
+            // Check if max retry count reached
+            if dead_letter.retry_count > self.config.max_retry_count {
+                warn!(
+                    "Event exceeded max retry count ({}), marking as permanently failed: {}",
+                    self.config.max_retry_count, dead_letter.failure_reason
+                );
+                stats.events_permanently_failed += 1;
+                permanently_failed_count += 1;
+            } else {
+                queue.push_front(dead_letter);
+                returned_count += 1;
+            }
+        }
+
+        stats.events_in_queue = queue.len();
+
+        if returned_count > 0 || permanently_failed_count > 0 {
+            debug!(
+                "Returned {} events to DLQ, {} permanently failed (queue size: {})",
+                returned_count,
+                permanently_failed_count,
+                queue.len()
+            );
+        }
+    }
+
+    /// Mark events as successfully recovered (sent to ES after retry).
+    /// Updates the events_recovered stat.
+    pub async fn mark_recovered(&self, count: usize) {
+        let mut stats = self.stats.write().await;
+        stats.events_recovered += count;
+
+        debug!("Marked {} events as recovered from DLQ", count);
     }
 
     pub async fn flush_to_disk(&self) -> Result<(), std::io::Error> {
@@ -260,6 +347,7 @@ mod tests {
             max_queue_size: 5,
             persistence_file: None,
             flush_interval: Duration::from_millis(100),
+            max_retry_count: 5,
         }
     }
 
@@ -268,6 +356,7 @@ mod tests {
             max_queue_size: 10,
             persistence_file: Some(file_path),
             flush_interval: Duration::from_millis(100),
+            max_retry_count: 5,
         }
     }
 
@@ -957,6 +1046,276 @@ mod tests {
         // Should only handle the first one and exit cleanly
         let result = tokio::time::timeout(Duration::from_millis(300), handle).await;
         assert!(result.is_ok(), "Should handle multiple signals gracefully");
+    }
+
+    // ============================================
+    // TDD Tests for Problem #6: DLQ Retry
+    // ============================================
+
+    #[tokio::test]
+    async fn test_take_batch_returns_events() {
+        // TDD: Test that take_batch removes and returns events from the queue
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add 5 events
+        for i in 0..5 {
+            let event = create_test_event(&format!("batch test {}", i));
+            dlq.add_failed_event(event, format!("batch failure {}", i))
+                .await;
+        }
+
+        // Take a batch of 3
+        let batch = dlq.take_batch(3).await;
+
+        // Should have 3 events
+        assert_eq!(batch.len(), 3, "Should take exactly 3 events");
+
+        // Should be FIFO order (oldest first)
+        assert_eq!(batch[0].event.message, "batch test 0");
+        assert_eq!(batch[1].event.message, "batch test 1");
+        assert_eq!(batch[2].event.message, "batch test 2");
+
+        // Queue should have 2 remaining
+        let queue = dlq.queue.read().await;
+        assert_eq!(queue.len(), 2, "Queue should have 2 remaining events");
+
+        // Remaining should be the last 2
+        let remaining: Vec<_> = queue.iter().collect();
+        assert_eq!(remaining[0].event.message, "batch test 3");
+        assert_eq!(remaining[1].event.message, "batch test 4");
+    }
+
+    #[tokio::test]
+    async fn test_take_batch_respects_limit() {
+        // TDD: Test that take_batch doesn't take more than available
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add only 2 events
+        for i in 0..2 {
+            let event = create_test_event(&format!("limit test {}", i));
+            dlq.add_failed_event(event, format!("limit failure {}", i))
+                .await;
+        }
+
+        // Try to take 10
+        let batch = dlq.take_batch(10).await;
+
+        // Should only get 2
+        assert_eq!(batch.len(), 2, "Should take only available events");
+
+        // Queue should be empty
+        let queue = dlq.queue.read().await;
+        assert_eq!(queue.len(), 0, "Queue should be empty");
+    }
+
+    #[tokio::test]
+    async fn test_take_batch_empty_queue() {
+        // TDD: Test that take_batch returns empty vec for empty queue
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Take from empty queue
+        let batch = dlq.take_batch(10).await;
+
+        assert!(batch.is_empty(), "Should return empty vec for empty queue");
+    }
+
+    #[tokio::test]
+    async fn test_take_batch_updates_stats() {
+        // TDD: Test that take_batch updates events_in_queue stat
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add 5 events
+        for i in 0..5 {
+            let event = create_test_event(&format!("stats test {}", i));
+            dlq.add_failed_event(event, format!("stats failure {}", i))
+                .await;
+        }
+
+        // Verify initial stats
+        {
+            let stats = dlq.stats.read().await;
+            assert_eq!(stats.events_in_queue, 5);
+        }
+
+        // Take 3
+        let _batch = dlq.take_batch(3).await;
+
+        // Stats should be updated
+        let stats = dlq.stats.read().await;
+        assert_eq!(
+            stats.events_in_queue, 2,
+            "Stats should reflect remaining events"
+        );
+        assert_eq!(stats.events_retried, 3, "Should track retried events");
+    }
+
+    #[tokio::test]
+    async fn test_return_failed_puts_events_back() {
+        // TDD: Test that return_failed puts events back to the queue
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add 3 events
+        for i in 0..3 {
+            let event = create_test_event(&format!("return test {}", i));
+            dlq.add_failed_event(event, format!("return failure {}", i))
+                .await;
+        }
+
+        // Take all events
+        let batch = dlq.take_batch(3).await;
+        assert_eq!(batch.len(), 3);
+
+        // Queue should be empty
+        {
+            let queue = dlq.queue.read().await;
+            assert_eq!(queue.len(), 0);
+        }
+
+        // Return failed events
+        dlq.return_failed(batch).await;
+
+        // Queue should have events back
+        let queue = dlq.queue.read().await;
+        assert_eq!(queue.len(), 3, "Events should be returned to queue");
+
+        // Should be at the FRONT (for immediate retry on next cycle)
+        let events: Vec<_> = queue.iter().collect();
+        assert_eq!(events[0].event.message, "return test 0");
+    }
+
+    #[tokio::test]
+    async fn test_return_failed_increments_retry_count() {
+        // TDD: Test that return_failed increments retry_count for each event
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add event with retry_count = 0
+        let event = create_test_event("retry count test");
+        dlq.add_failed_event(event, "retry failure".to_string())
+            .await;
+
+        // Take and return multiple times
+        for expected_retry_count in 1..=3 {
+            let batch = dlq.take_batch(1).await;
+            assert_eq!(batch[0].retry_count, expected_retry_count - 1);
+
+            dlq.return_failed(batch).await;
+
+            let queue = dlq.queue.read().await;
+            assert_eq!(
+                queue.front().unwrap().retry_count,
+                expected_retry_count,
+                "retry_count should be {} after {} returns",
+                expected_retry_count,
+                expected_retry_count
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_return_failed_updates_stats() {
+        // TDD: Test that return_failed updates events_in_queue stat
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add 3 events
+        for i in 0..3 {
+            let event = create_test_event(&format!("stats return test {}", i));
+            dlq.add_failed_event(event, format!("stats failure {}", i))
+                .await;
+        }
+
+        // Take all
+        let batch = dlq.take_batch(3).await;
+
+        // Stats should show empty queue
+        {
+            let stats = dlq.stats.read().await;
+            assert_eq!(stats.events_in_queue, 0);
+        }
+
+        // Return failed
+        dlq.return_failed(batch).await;
+
+        // Stats should be updated
+        let stats = dlq.stats.read().await;
+        assert_eq!(
+            stats.events_in_queue, 3,
+            "Stats should reflect returned events"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_recovered_updates_stats() {
+        // TDD: Test that mark_recovered updates events_recovered stat
+        let config = create_test_config();
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add events
+        for i in 0..5 {
+            let event = create_test_event(&format!("recovered test {}", i));
+            dlq.add_failed_event(event, format!("recovered failure {}", i))
+                .await;
+        }
+
+        // Mark some as recovered
+        dlq.mark_recovered(3).await;
+
+        let stats = dlq.stats.read().await;
+        assert_eq!(stats.events_recovered, 3, "Should track recovered events");
+    }
+
+    #[tokio::test]
+    async fn test_return_failed_filters_max_retry() {
+        // TDD: Test that return_failed moves events to permanent fail when max retry reached
+        let mut config = create_test_config();
+        config.max_retry_count = 3; // After 3 retries, mark as permanent fail
+        let dlq = DeadLetterQueue::new(config);
+
+        // Add event
+        let event = create_test_event("max retry test");
+        dlq.add_failed_event(event, "max retry failure".to_string())
+            .await;
+
+        // Simulate retry loop until max retry reached
+        for i in 0..3 {
+            let batch = dlq.take_batch(1).await;
+            assert_eq!(batch.len(), 1, "Should have 1 event for retry {}", i);
+            dlq.return_failed(batch).await;
+        }
+
+        // Take the 4th time (retry_count = 3)
+        let batch = dlq.take_batch(1).await;
+        assert_eq!(batch[0].retry_count, 3, "Should have retry_count = 3");
+
+        // Return again - should be filtered out and marked as permanent fail
+        dlq.return_failed(batch).await;
+
+        // Queue should be empty (event moved to permanent fail)
+        let queue = dlq.queue.read().await;
+        assert_eq!(queue.len(), 0, "Event should be removed after max retries");
+
+        // Stats should show permanent failure
+        let stats = dlq.stats.read().await;
+        assert_eq!(
+            stats.events_permanently_failed, 1,
+            "Should mark as permanently failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_retry_config_default() {
+        // TDD: Test that default config has max_retry_count
+        let config = DeadLetterQueueConfig::default();
+        assert_eq!(
+            config.max_retry_count, 5,
+            "Default max_retry_count should be 5"
+        );
     }
 
     #[tokio::test]
