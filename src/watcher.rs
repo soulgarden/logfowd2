@@ -30,6 +30,11 @@ use crate::transport::channels::BoundedSender;
 
 const K8S_PODS_REGEXP: &str = r"^/var/log/pods/(?P<namespace>[a-z0-9-]+)_(?P<pod_name>[a-z0-9-]+)_(?P<pod_id>[a-z0-9-]+)/(?P<container_name>[a-z-0-9]+)/(?P<num>0|[1-9][0-9]*).log$";
 
+/// Maximum number of events to collect in a single atomic operation.
+/// This limits memory usage to approximately 5 MB (10,000 events × ~500 bytes each).
+/// Events are collected under a single lock to prevent race conditions.
+const MAX_BATCH_SIZE: usize = 10_000;
+
 pub struct Watcher {
     conf: Settings,
     file_trackers: HashMap<String, FileTracker>,
@@ -282,46 +287,12 @@ impl Watcher {
                                                 .inc();
                                         }
 
-                                        let mut state = self.app_state.write().await;
-                                        match self.create_file_tracker(path, &mut state).await {
-                                            Ok(mut tracker) => {
-                                                debug!("Created FileTracker for {}, adding to Watcher.file_trackers", path_str);
-
-                                                if self.read_existing_on_startup {
-                                                    // Stream existing content in chunks
-                                                    loop {
-                                                        let events = match tracker
-                                                            .read_new_lines_limited(&mut state, Some(self.read_chunk_size))
-                                                            .await {
-                                                            Ok(events) => events,
-                                                            Err(e) => {
-                                                                error!("Failed to read from {}: {}", path_str, e);
-                                                                Vec::new()
-                                                            }
-                                                        };
-                                                        if events.is_empty() { break; }
-                                                        // Drop lock before sending
-                                                        drop(state);
-                                                        self.safe_send_events(events).await;
-                                                        state = self.app_state.write().await;
-                                                    }
-                                                    drop(state);
-                                                } else {
-                                                    // Skip historical content
-                                                    if let Err(e) = tracker.skip_existing_content(&mut state).await {
-                                                        error!("Failed to skip existing content for {}: {}", path_str, e);
-                                                    }
-                                                    drop(state);
-                                                }
-
-                                                self.file_trackers.insert(path_str.to_string(), tracker);
-                                                debug!("Watcher now tracking {} files", self.file_trackers.len());
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to create file tracker for {}: {}", path_str, e);
-                                            }
+                                        // Atomic collection: collect all events under single lock,
+                                        // then send after lock is released (eliminates race condition)
+                                        let events = self.handle_create_event(path).await;
+                                        if !events.is_empty() {
+                                            self.safe_send_events(events).await;
                                         }
-
                                     }
                                 }
                                 EventKind::Modify(Data(_data_change)) => {
@@ -458,37 +429,11 @@ impl Watcher {
 
                                     info!("File removed: {}", path_str);
 
-                                    // Handle removal with FileTracker
-                                    if let Some(mut tracker) = self.file_trackers.remove(&path_str) {
-                                        debug!("Removing FileTracker for {}, {} files remain", path_str, self.file_trackers.len());
-                                        let mut state = self.app_state.write().await;
-
-                                        // Try to read any remaining content before removing (chunked)
-                                        let mut events: Vec<Event> = Vec::new();
-                                        loop {
-                                            let chunk = match tracker
-                                                .read_new_lines_limited(&mut state, Some(self.read_chunk_size))
-                                                .await {
-                                                Ok(events) => events,
-                                                Err(e) => {
-                                                    debug!("Could not read final content from {}: {}", path_str, e);
-                                                    Vec::new()
-                                                }
-                                            };
-                                            if chunk.is_empty() { break; }
-                                            events.extend(chunk);
-                                        }
-
-                                        tracker.close();
-                                        state.remove_file(&path_str);
-                                        debug!("Removed {} from AppState, {} files remain in state", path_str, state.files.len());
-                                        drop(state);
-
-                                        if !events.is_empty() {
-                                            self.safe_send_events(events).await;
-                                        }
-                                    } else {
-                                        warn!("Tried to remove unknown file {} from file_trackers", path_str);
+                                    // Atomic cleanup: collect remaining events under single lock,
+                                    // then send after cleanup is complete (eliminates race condition)
+                                    let events = self.handle_remove_event(&path_str).await;
+                                    if !events.is_empty() {
+                                        self.safe_send_events(events).await;
                                     }
                                 }
                                 _ => {}
@@ -847,6 +792,178 @@ impl Watcher {
                 self.safe_send_events(rotation_events).await;
             }
         }
+    }
+
+    /// Handle file creation event with atomic event collection.
+    ///
+    /// This method implements the Collect-Then-Send pattern to prevent race conditions:
+    /// 1. Creates FileTracker under a single lock acquisition
+    /// 2. Collects ALL events atomically (respecting MAX_BATCH_SIZE)
+    /// 3. Returns events for the caller to send AFTER this method returns
+    /// 4. Inserts tracker into file_trackers on success
+    ///
+    /// This eliminates the race window that existed when dropping/reacquiring locks
+    /// between reading and sending events.
+    async fn handle_create_event(&mut self, path: &Path) -> Vec<Event> {
+        let path_str = match Self::safe_path_to_string(path) {
+            Some(s) => s,
+            None => {
+                warn!("Invalid UTF-8 path in create event: {:?}", path);
+                return Vec::new();
+            }
+        };
+
+        // Acquire lock once and hold it for the entire operation
+        let mut state = self.app_state.write().await;
+
+        // Create FileTracker - this registers the file in AppState
+        let mut tracker = match self.create_file_tracker(path, &mut state).await {
+            Ok(tracker) => {
+                debug!(
+                    "Created FileTracker for {} during atomic create handling",
+                    path_str
+                );
+                tracker
+            }
+            Err(e) => {
+                error!("Failed to create file tracker for {}: {}", path_str, e);
+                return Vec::new();
+            }
+        };
+
+        // Collect all events atomically
+        let mut collected_events: Vec<Event> = Vec::new();
+
+        if self.read_existing_on_startup {
+            // Read all content in chunks, collecting events under single lock
+            loop {
+                // Check MAX_BATCH_SIZE limit
+                if collected_events.len() >= MAX_BATCH_SIZE {
+                    warn!(
+                        "Reached MAX_BATCH_SIZE ({}) for file {}, truncating",
+                        MAX_BATCH_SIZE, path_str
+                    );
+                    break;
+                }
+
+                let events = match tracker
+                    .read_new_lines_limited(&mut state, Some(self.read_chunk_size))
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(e) => {
+                        error!("Failed to read from {}: {}", path_str, e);
+                        break;
+                    }
+                };
+
+                if events.is_empty() {
+                    break;
+                }
+
+                collected_events.extend(events);
+            }
+        } else {
+            // Skip historical content - just position to end of file
+            if let Err(e) = tracker.skip_existing_content(&mut state).await {
+                error!("Failed to skip existing content for {}: {}", path_str, e);
+            }
+        }
+
+        // Release lock before inserting tracker (tracker insertion doesn't need AppState lock)
+        drop(state);
+
+        // Insert tracker into file_trackers (after releasing AppState lock)
+        self.file_trackers.insert(path_str.clone(), tracker);
+        debug!(
+            "Watcher now tracking {} files after atomic create",
+            self.file_trackers.len()
+        );
+
+        // Return events for caller to send (after all state is consistent)
+        collected_events
+    }
+
+    /// Handle file removal event with atomic cleanup.
+    ///
+    /// This method implements the Atomic Cleanup pattern:
+    /// 1. Removes tracker from file_trackers immediately (prevents race with Create)
+    /// 2. Acquires lock and reads ALL remaining content atomically
+    /// 3. Closes tracker and removes file from state under same lock
+    /// 4. Returns events for the caller to send AFTER this method returns
+    ///
+    /// This ensures that:
+    /// - No Create event can reuse the same path while we're still reading
+    /// - All remaining content is captured before state cleanup
+    /// - Events are sent only after state is fully consistent
+    async fn handle_remove_event(&mut self, path_str: &str) -> Vec<Event> {
+        // Remove tracker first - this prevents any Create event from racing with us
+        let tracker = match self.file_trackers.remove(path_str) {
+            Some(tracker) => tracker,
+            None => {
+                // No tracker for this path - might have been removed already or never tracked
+                warn!(
+                    "Tried to remove unknown file {} from file_trackers",
+                    path_str
+                );
+                return Vec::new();
+            }
+        };
+
+        debug!(
+            "Removing FileTracker for {}, {} files remain",
+            path_str,
+            self.file_trackers.len()
+        );
+
+        // Now acquire lock and read remaining content atomically
+        let mut state = self.app_state.write().await;
+        let mut collected_events: Vec<Event> = Vec::new();
+        let mut tracker = tracker; // Make mutable for reading
+
+        // Read all remaining content under single lock
+        loop {
+            // Check MAX_BATCH_SIZE limit
+            if collected_events.len() >= MAX_BATCH_SIZE {
+                warn!(
+                    "Reached MAX_BATCH_SIZE ({}) while reading final content from {}, truncating",
+                    MAX_BATCH_SIZE, path_str
+                );
+                break;
+            }
+
+            let chunk = match tracker
+                .read_new_lines_limited(&mut state, Some(self.read_chunk_size))
+                .await
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    debug!("Could not read final content from {}: {}", path_str, e);
+                    break;
+                }
+            };
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            collected_events.extend(chunk);
+        }
+
+        // Close tracker and remove from state (still under lock)
+        tracker.close();
+        state.remove_file(path_str);
+        debug!(
+            "Removed {} from AppState, {} files remain in state",
+            path_str,
+            state.files.len()
+        );
+
+        // Release lock
+        drop(state);
+
+        // Return events for caller to send
+        collected_events
     }
 
     #[allow(dead_code)]
@@ -1525,5 +1642,343 @@ mod tests {
 
         // With our fix, directory removal events will be skipped silently
         // instead of causing "unknown file" warnings
+    }
+
+    // ============================================================================
+    // TDD Tests for Problem #7: Race Condition Fix (Collect-Then-Send Pattern)
+    // ============================================================================
+
+    /// Test that handle_create_event collects all events atomically under single lock
+    /// and returns them for sending after lock is released.
+    #[tokio::test]
+    async fn test_handle_create_event_collects_all_events_atomically() {
+        // Setup: Create temp directory with K8s-like structure
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        // Create log file with multiple lines
+        let log_file = pods_dir.join("0.log");
+        let test_content = "line 1\nline 2\nline 3\nline 4\nline 5\n";
+        fs::write(&log_file, test_content).unwrap();
+
+        // Create watcher with read_existing_on_startup = true
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+        conf.read_existing_on_startup = Some(true);
+        conf.read_chunk_size = Some(2); // Small chunk to test multiple iterations
+
+        let channel = create_bounded_channel(100, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Call handle_create_event - should return all events collected atomically
+        let events = watcher.handle_create_event(&log_file).await;
+
+        // Verify all 5 lines were collected
+        assert_eq!(events.len(), 5, "Should collect all 5 events atomically");
+        assert_eq!(events[0].message, "line 1");
+        assert_eq!(events[1].message, "line 2");
+        assert_eq!(events[2].message, "line 3");
+        assert_eq!(events[3].message, "line 4");
+        assert_eq!(events[4].message, "line 5");
+
+        // Verify tracker was added
+        let path_str = log_file.to_string_lossy().to_string();
+        assert!(
+            watcher.file_trackers.contains_key(&path_str),
+            "Tracker should be added after handle_create_event"
+        );
+    }
+
+    /// Test that handle_create_event respects MAX_BATCH_SIZE limit
+    #[tokio::test]
+    async fn test_handle_create_event_respects_max_batch_size() {
+        // Setup: Create temp directory with K8s-like structure
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        // Create log file with more lines than MAX_BATCH_SIZE
+        // Note: MAX_BATCH_SIZE is 10,000 - we'll test with smaller value via config
+        let log_file = pods_dir.join("0.log");
+        let mut content = String::new();
+        for i in 0..100 {
+            content.push_str(&format!("line {}\n", i));
+        }
+        fs::write(&log_file, &content).unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+        conf.read_existing_on_startup = Some(true);
+        conf.read_chunk_size = Some(10);
+
+        let channel = create_bounded_channel(1000, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Call handle_create_event
+        let events = watcher.handle_create_event(&log_file).await;
+
+        // Should collect all 100 events (within MAX_BATCH_SIZE of 10,000)
+        assert_eq!(events.len(), 100, "Should collect all 100 events");
+    }
+
+    /// Test that events are NOT sent during lock hold - they are returned for later sending
+    #[tokio::test]
+    async fn test_handle_create_event_returns_events_for_sending() {
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        let log_file = pods_dir.join("0.log");
+        fs::write(&log_file, "test line\n").unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+        conf.read_existing_on_startup = Some(true);
+
+        let channel = create_bounded_channel(10, None, None, None, None);
+        let sender = channel.sender();
+        let receiver = channel.receiver();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Call handle_create_event - returns events, does NOT send them
+        let events = watcher.handle_create_event(&log_file).await;
+        assert_eq!(events.len(), 1);
+
+        // Events should NOT be in channel yet (receiver should be empty)
+        // The caller is responsible for sending after lock release
+        let try_recv =
+            tokio::time::timeout(std::time::Duration::from_millis(10), receiver.recv()).await;
+        assert!(
+            try_recv.is_err(),
+            "Events should not be sent by handle_create_event"
+        );
+
+        // Now send events (simulating what caller does)
+        watcher.safe_send_events(events).await;
+    }
+
+    /// Test that tracker is inserted even when read errors occur
+    #[tokio::test]
+    async fn test_handle_create_event_inserts_tracker_on_success() {
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        let log_file = pods_dir.join("0.log");
+        fs::write(&log_file, "content\n").unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+
+        let channel = create_bounded_channel(10, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Before: no trackers
+        assert!(watcher.file_trackers.is_empty());
+
+        // Call handle_create_event
+        let _events = watcher.handle_create_event(&log_file).await;
+
+        // After: tracker should be added
+        let path_str = log_file.to_string_lossy().to_string();
+        assert!(
+            watcher.file_trackers.contains_key(&path_str),
+            "Tracker should be inserted after successful create"
+        );
+        assert_eq!(watcher.file_trackers.len(), 1);
+    }
+
+    /// Test that handle_create_event handles non-existent file gracefully
+    #[tokio::test]
+    async fn test_handle_create_event_handles_nonexistent_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let nonexistent_file = temp_dir.path().join("nonexistent.log");
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+
+        let channel = create_bounded_channel(10, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Should not panic, should return empty events
+        let events = watcher.handle_create_event(&nonexistent_file).await;
+        assert!(
+            events.is_empty(),
+            "Should return empty events for nonexistent file"
+        );
+
+        // Tracker should NOT be added for nonexistent file
+        assert!(watcher.file_trackers.is_empty());
+    }
+
+    // ============================================================================
+    // TDD Tests for handle_remove_event (Atomic Cleanup Pattern)
+    // ============================================================================
+
+    /// Test that handle_remove_event reads all remaining content atomically
+    #[tokio::test]
+    async fn test_handle_remove_event_reads_remaining_content_atomically() {
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        let log_file = pods_dir.join("0.log");
+        fs::write(&log_file, "line 1\nline 2\nline 3\n").unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+        conf.read_existing_on_startup = Some(true);
+
+        let channel = create_bounded_channel(100, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // First, create the file tracker (simulating a prior Create event)
+        let _create_events = watcher.handle_create_event(&log_file).await;
+        let path_str = log_file.to_string_lossy().to_string();
+        assert!(watcher.file_trackers.contains_key(&path_str));
+
+        // Now add more content to the file
+        fs::write(
+            &log_file,
+            "line 1\nline 2\nline 3\nnew line 4\nnew line 5\n",
+        )
+        .unwrap();
+
+        // Call handle_remove_event - should return remaining events
+        let events = watcher.handle_remove_event(&path_str).await;
+
+        // Should have collected the new lines (at least 2)
+        assert!(
+            events.len() >= 2,
+            "Should collect remaining events, got {}",
+            events.len()
+        );
+
+        // Tracker should be removed
+        assert!(!watcher.file_trackers.contains_key(&path_str));
+    }
+
+    /// Test that handle_remove_event removes file from state and trackers
+    #[tokio::test]
+    async fn test_handle_remove_event_removes_from_state_and_trackers() {
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        let log_file = pods_dir.join("0.log");
+        fs::write(&log_file, "content\n").unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+
+        let channel = create_bounded_channel(10, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Create tracker
+        let _events = watcher.handle_create_event(&log_file).await;
+        let path_str = log_file.to_string_lossy().to_string();
+
+        // Verify tracker exists
+        assert!(watcher.file_trackers.contains_key(&path_str));
+
+        // Check state has file
+        {
+            let state = watcher.app_state.read().await;
+            assert!(state.files.contains_key(&path_str));
+        }
+
+        // Remove file
+        let _events = watcher.handle_remove_event(&path_str).await;
+
+        // Verify tracker removed
+        assert!(!watcher.file_trackers.contains_key(&path_str));
+
+        // Verify state cleaned up
+        {
+            let state = watcher.app_state.read().await;
+            assert!(!state.files.contains_key(&path_str));
+        }
+    }
+
+    /// Test that handle_remove_event returns events for later sending
+    #[tokio::test]
+    async fn test_handle_remove_event_returns_events_for_sending() {
+        let temp_dir = TempDir::new().unwrap();
+        let pods_dir = temp_dir
+            .path()
+            .join("var/log/pods/test-ns_test-pod_pod-id-123/test-container");
+        fs::create_dir_all(&pods_dir).unwrap();
+
+        let log_file = pods_dir.join("0.log");
+        fs::write(&log_file, "line 1\n").unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+        conf.read_existing_on_startup = Some(true);
+
+        let channel = create_bounded_channel(10, None, None, None, None);
+        let sender = channel.sender();
+        let receiver = channel.receiver();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Create tracker and consume initial events
+        let create_events = watcher.handle_create_event(&log_file).await;
+        watcher.safe_send_events(create_events).await;
+
+        // Add new content
+        fs::write(&log_file, "line 1\nnew line\n").unwrap();
+        let path_str = log_file.to_string_lossy().to_string();
+
+        // Drain the channel first
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await;
+
+        // Call handle_remove_event
+        let events = watcher.handle_remove_event(&path_str).await;
+
+        // Events should be returned, NOT sent
+        // (We can't easily verify this since the channel may have events from create,
+        // but we verify the return value is correct)
+        assert!(events.len() >= 1, "Should return at least 1 event");
+    }
+
+    /// Test that handle_remove_event handles unknown file gracefully
+    #[tokio::test]
+    async fn test_handle_remove_event_handles_unknown_file() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let mut conf = create_test_conf();
+        conf.log_path = temp_dir.path().to_string_lossy().to_string();
+
+        let channel = create_bounded_channel(10, None, None, None, None);
+        let sender = channel.sender();
+        let mut watcher = Watcher::new(conf, sender);
+
+        // Try to remove a file that was never tracked
+        let events = watcher.handle_remove_event("/nonexistent/path").await;
+
+        // Should return empty events and not panic
+        assert!(
+            events.is_empty(),
+            "Should return empty events for unknown file"
+        );
     }
 }

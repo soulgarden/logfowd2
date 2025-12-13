@@ -172,7 +172,9 @@ impl DeadLetterQueue {
         if returned_count > 0 || permanently_failed_count > 0 {
             debug!(
                 "Returned {} events to DLQ, {} permanently failed (queue size: {})",
-                returned_count, permanently_failed_count, queue.len()
+                returned_count,
+                permanently_failed_count,
+                queue.len()
             );
         }
     }
@@ -1144,7 +1146,10 @@ mod tests {
 
         // Stats should be updated
         let stats = dlq.stats.read().await;
-        assert_eq!(stats.events_in_queue, 2, "Stats should reflect remaining events");
+        assert_eq!(
+            stats.events_in_queue, 2,
+            "Stats should reflect remaining events"
+        );
         assert_eq!(stats.events_retried, 3, "Should track retried events");
     }
 
@@ -1239,7 +1244,10 @@ mod tests {
 
         // Stats should be updated
         let stats = dlq.stats.read().await;
-        assert_eq!(stats.events_in_queue, 3, "Stats should reflect returned events");
+        assert_eq!(
+            stats.events_in_queue, 3,
+            "Stats should reflect returned events"
+        );
     }
 
     #[tokio::test]
@@ -1304,7 +1312,10 @@ mod tests {
     async fn test_max_retry_config_default() {
         // TDD: Test that default config has max_retry_count
         let config = DeadLetterQueueConfig::default();
-        assert_eq!(config.max_retry_count, 5, "Default max_retry_count should be 5");
+        assert_eq!(
+            config.max_retry_count, 5,
+            "Default max_retry_count should be 5"
+        );
     }
 
     #[tokio::test]

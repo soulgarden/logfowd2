@@ -172,7 +172,10 @@ impl Sender {
                 }
                 Err(crate::transport::channels::SendError::Closed(returned_events)) => {
                     // Channel closed - return events for later retry
-                    warn!("ES channel closed, {} events will be retried", returned_events.len());
+                    warn!(
+                        "ES channel closed, {} events will be retried",
+                        returned_events.len()
+                    );
                     if self.metrics_enabled {
                         metrics()
                             .errors_total
@@ -1203,11 +1206,18 @@ mod tests {
             .await
             .expect("Should receive second batch - events must NOT be lost!")
             .unwrap();
-        assert_eq!(batch2.len(), 5, "Second batch should have 5 events - none lost!");
+        assert_eq!(
+            batch2.len(),
+            5,
+            "Second batch should have 5 events - none lost!"
+        );
 
         // Verify total events
         let total_events = batch1.len() + batch2.len();
-        assert_eq!(total_events, 10, "All 10 events must be delivered, none lost!");
+        assert_eq!(
+            total_events, 10,
+            "All 10 events must be delivered, none lost!"
+        );
 
         shutdown.notify_one();
         let _ = timeout(Duration::from_millis(500), sender_handle).await;
@@ -1227,17 +1237,18 @@ mod tests {
         es_sender.send(batch1).await.unwrap();
 
         // Now channel is full - try_send should return the events, not lose them
-        let batch2 = vec![
-            create_test_event("second_1"),
-            create_test_event("second_2"),
-        ];
+        let batch2 = vec![create_test_event("second_1"), create_test_event("second_2")];
 
         // This should fail with Full error and return our events
         let result = es_sender.try_send(batch2);
 
         match result {
             Err(SendError::Full(returned_events)) => {
-                assert_eq!(returned_events.len(), 2, "Events must be returned, not lost!");
+                assert_eq!(
+                    returned_events.len(),
+                    2,
+                    "Events must be returned, not lost!"
+                );
                 assert_eq!(returned_events[0].message, "second_1");
                 assert_eq!(returned_events[1].message, "second_2");
             }
@@ -1298,7 +1309,10 @@ mod tests {
         })
         .await;
 
-        assert!(sender_result.is_ok(), "Sender should complete within timeout");
+        assert!(
+            sender_result.is_ok(),
+            "Sender should complete within timeout"
+        );
 
         // Wait for sender to finish
         let _ = timeout(Duration::from_secs(1), sender_handle).await;
@@ -1426,7 +1440,10 @@ mod tests {
 
         // Sender should complete (not hang forever) - within retry timeout
         let result = timeout(Duration::from_secs(6), sender_handle).await;
-        assert!(result.is_ok(), "Sender should not hang when ES channel is closed");
+        assert!(
+            result.is_ok(),
+            "Sender should not hang when ES channel is closed"
+        );
     }
 
     #[tokio::test]
