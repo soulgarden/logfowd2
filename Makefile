@@ -1,6 +1,6 @@
 VERSION := $(shell cat VERSION)
 
-.PHONY: fmt lint test check build_dev build_release helm_validate dev_check ci \
+.PHONY: fmt lint lint_fix test check build_dev build_release helm_validate dev_check ci \
         docker_up docker_down build docker-build docker-build-local \
         create_namespace helm_install helm_upgrade helm_delete \
         get-version increment-version release-patch release-minor release-major
@@ -10,7 +10,10 @@ fmt:
 	cargo fmt --all
 
 lint:
-	cargo clippy --fix --allow-dirty
+	cargo clippy --all-targets -- -D warnings
+
+lint_fix:
+	cargo clippy --all-targets --fix --allow-dirty -- -D warnings
 
 test:
 	cargo test -- --test-threads=1
@@ -29,8 +32,8 @@ helm_validate:
 	helm lint helm/logfowd2
 	helm template logfowd helm/logfowd2 --validate --dry-run
 
-# Run all development checks (format, lint, test, build, helm validation)
-dev_check: fmt lint test check build_dev helm_validate
+# Run all development checks (format, lint_fix, test, build, helm validation)
+dev_check: fmt lint_fix test check build_dev helm_validate
 	@echo "All development checks passed!"
 
 # Run CI pipeline (check, test, build)

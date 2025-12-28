@@ -1588,7 +1588,7 @@ mod tests {
         // The test verifies that the function completes without crashing
         // Files won't match K8s regex so no trackers will be created, but that's ok
         // The important thing is that no unwrap() panic occurred during directory traversal
-        assert!(true, "sync_files completed without panicking");
+        // If we reach this point, sync_files completed without panicking
     }
 
     #[tokio::test]
@@ -1957,7 +1957,7 @@ mod tests {
         // Events should be returned, NOT sent
         // (We can't easily verify this since the channel may have events from create,
         // but we verify the return value is correct)
-        assert!(events.len() >= 1, "Should return at least 1 event");
+        assert!(!events.is_empty(), "Should return at least 1 event");
     }
 
     /// Test that handle_remove_event handles unknown file gracefully
