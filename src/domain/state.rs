@@ -556,12 +556,11 @@ mod tests {
 
         // Manually corrupt the file by changing data but keeping the original checksum
         let mut modified: serde_json::Value = serde_json::from_str(&original_content).unwrap();
-        if let Some(files) = modified["files"].as_object_mut() {
-            if let Some(file_state) = files.values_mut().next() {
-                if let Some(position) = file_state.get_mut("position") {
-                    *position = serde_json::Value::Number(serde_json::Number::from(999));
-                }
-            }
+        if let Some(files) = modified["files"].as_object_mut()
+            && let Some(file_state) = files.values_mut().next()
+            && let Some(position) = file_state.get_mut("position")
+        {
+            *position = serde_json::Value::Number(serde_json::Number::from(999));
         }
         // Keep the original checksum - this should cause a mismatch
         modified["checksum"] = serde_json::Value::String(original_checksum.to_string());

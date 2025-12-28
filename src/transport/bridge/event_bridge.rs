@@ -391,10 +391,9 @@ mod tests {
         for _ in 0..3 {
             if let Ok(result) =
                 tokio::time::timeout(Duration::from_millis(100), bounded_receiver.recv()).await
+                && result.is_ok()
             {
-                if result.is_ok() {
-                    received_count += 1;
-                }
+                received_count += 1;
             }
         }
 

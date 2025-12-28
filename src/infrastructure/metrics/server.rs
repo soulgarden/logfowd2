@@ -146,21 +146,18 @@ mod tests {
         });
 
         // Both should return false when config is None or enabled is None
-        assert_eq!(
-            are_metrics_enabled(&config_none),
-            false,
+        assert!(
+            !are_metrics_enabled(&config_none),
             "are_metrics_enabled should default to false when config is None"
         );
-        assert_eq!(
-            are_metrics_enabled(&config_enabled_none),
-            false,
+        assert!(
+            !are_metrics_enabled(&config_enabled_none),
             "are_metrics_enabled should default to false when enabled is None"
         );
 
         // Verify that unwrap_or(false) in metrics_server matches this behavior
-        assert_eq!(
-            config_enabled_none.as_ref().unwrap().enabled,
-            false,
+        assert!(
+            !config_enabled_none.as_ref().unwrap().enabled,
             "metrics_server should also default to false when enabled is false"
         );
     }
