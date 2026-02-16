@@ -1,4 +1,4 @@
-FROM rust:1.91-alpine AS builder
+FROM rust:1.93.1-alpine AS builder
 
 RUN apk add --no-cache musl-dev pkgconfig gcc make && \
     rustup target add x86_64-unknown-linux-musl
@@ -9,7 +9,7 @@ WORKDIR /tmp/rust/src/github.com/soulgarden/logfowd2
 
 RUN cargo build --target=x86_64-unknown-linux-musl --release
 
-FROM alpine:3.22
+FROM alpine:3.23
 
 RUN adduser -S www-data -G www-data
 

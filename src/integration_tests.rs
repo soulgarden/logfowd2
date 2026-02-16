@@ -236,9 +236,15 @@ mod tests {
         // Give watcher a moment to start
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Stop watcher immediately and verify clean shutdown
-        shutdown_notify.notify_one();
-        let watcher_result = timeout(Duration::from_millis(1000), watcher_handle)
+        // Stop watcher and retry shutdown notification briefly to avoid startup races
+        shutdown_notify.notify_waiters();
+        let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !watcher_handle.is_finished() && tokio::time::Instant::now() < shutdown_deadline {
+            shutdown_notify.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let watcher_result = timeout(Duration::from_secs(5), watcher_handle)
             .await
             .expect("Watcher should shut down within timeout")
             .expect("Watcher task should complete");
