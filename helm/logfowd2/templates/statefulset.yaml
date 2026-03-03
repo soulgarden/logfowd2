@@ -12,10 +12,13 @@ spec:
       {{- include "logfowd2.selectorLabels" . | nindent 6 }}
   template:
     metadata:
+      {{- $podAnnotations := dict }}
       {{- with .Values.podAnnotations }}
-      annotations:
-        {{- toYaml . | nindent 8 }}
+      {{- $podAnnotations = mergeOverwrite $podAnnotations . }}
       {{- end }}
+      {{- $podAnnotations = mergeOverwrite $podAnnotations (dict "checksum/config" (include (print $.Template.BasePath "/configmap.yaml") . | sha256sum)) }}
+      annotations:
+        {{- toYaml $podAnnotations | nindent 8 }}
       labels:
         {{- include "logfowd2.selectorLabels" . | nindent 8 }}
     spec:
@@ -30,6 +33,10 @@ spec:
         - name: {{ .Chart.Name }}
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.service.targetPort | default .Values.service.port }}
+              protocol: TCP
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           securityContext:
@@ -43,7 +50,7 @@ spec:
             - { name: varlog, mountPath: /var/log, readOnly: true }
             - { name: config, subPath: config.json, mountPath: /config.json, readOnly: true }
       volumes:
-        - { name: varlog, hostPath: { path: "/var/log" } }
+        - { name: varlog, hostPath: { path: {{ .Values.hostPath.path | quote }}, type: {{ .Values.hostPath.type | quote }} } }
         - { name: config, configMap: { name: {{ include "logfowd2.fullname" . }}-config } }
       {{- with .Values.nodeSelector }}
       nodeSelector:

@@ -8,7 +8,7 @@ image:
   repository: soulgarden/logfowd2
   pullPolicy: Always
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "0.5.0"
+  tag: "0.5.1"
 
 imagePullSecrets: [ ]
 nameOverride: ""
@@ -35,6 +35,12 @@ securityContext:
 
 service:
   type: ClusterIP
+  port: 9090
+  targetPort: 9090
+
+hostPath:
+  path: /var/log
+  type: Directory
 
 ingress:
   enabled: false
@@ -45,8 +51,8 @@ ingress:
   hosts:
     - host: chart-example.local
       paths:
-        - path: /
-          pathType: ImplementationSpecific
+        - path: /metrics
+          pathType: Prefix
   tls: [ ]
   #  - secretName: chart-example-tls
   #    hosts:
@@ -77,6 +83,10 @@ tolerations: [ ]
 
 app:
   env: prod
+  metrics:
+    enabled: false
+    port: 9090
+    path: /metrics
   logging:
     log_level: "info"
     log_format: "json"
@@ -91,6 +101,11 @@ app:
     backpressure_threshold: 0.8
     backpressure_min_delay_ms: 5
     backpressure_max_delay_ms: 60
+    notify_buffer_warning_threshold: 1000
+    notify_buffer_max_size: 10000
+    notify_drop_on_overflow: true
+    notify_filesystem_buffer_warning_threshold: 1000
+    notify_filesystem_buffer_size: 1024
   elasticsearch:
     host: http://elasticsearch-master
     port: 9200

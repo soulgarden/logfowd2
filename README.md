@@ -52,6 +52,12 @@ The Helm chart deploys `replicaCount` instances and uses required pod anti-affin
 helm upgrade -n logging logfowd helm/logfowd2 --wait --set replicaCount=3
 ```
 
+## Ingress and metrics
+
+`Ingress` is disabled by default and is not required for the log forwarding data path.
+If you enable `ingress.enabled=true`, also enable metrics (`app.metrics.enabled=true`), because ingress routes to the metrics HTTP endpoint (`/metrics`, default port `9090`).
+This is enforced by chart schema validation (`helm/logfowd2/values.schema.json`).
+
 ## Configuration
 
 The Helm chart generates a `config.json` and mounts it into the container at `/config.json`. The binary reads `./config.json` by default (override via `CFG_PATH`).
@@ -75,6 +81,7 @@ Minimal config example:
 ```
 
 See `config.json` for a complete example, and `helm/logfowd2/values.yaml` for Helm values.
+Chart value constraints are defined in `helm/logfowd2/values.schema.json`.
 
 Example Helm overrides:
 
@@ -87,12 +94,24 @@ helm upgrade -n logging logfowd helm/logfowd2 --wait \
 
 ## Testing and development
 
-Tests: 293 unit/integration tests (as of Feb 16, 2026), executed in CI.
-
 ```bash
 make test
 make dev_check
 make ci
+```
+
+Helm checks:
+
+```bash
+helm lint --strict helm/logfowd2
+helm template logfowd helm/logfowd2
+helm template logfowd helm/logfowd2 --set ingress.enabled=true --set app.metrics.enabled=true
+```
+
+Kube-linter check used in this project:
+
+```bash
+kube-linter lint helm/logfowd2 --exclude run-as-non-root --exclude no-read-only-root-fs
 ```
 
 For local development, Rust `1.93.1` is pinned in `rust-toolchain.toml`.

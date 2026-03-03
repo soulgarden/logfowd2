@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "logfowd2 values",
+  "type": "object",
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "image": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string",
+          "minLength": 1
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      },
+      "required": ["repository", "pullPolicy"],
+      "additionalProperties": true
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "targetPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      },
+      "required": ["type", "port", "targetPort"],
+      "additionalProperties": true
+    },
+    "hostPath": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "enum": ["", "Directory", "File", "Socket", "CharDevice", "BlockDevice", "DirectoryOrCreate", "FileOrCreate"]
+        }
+      },
+      "required": ["path", "type"],
+      "additionalProperties": true
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "host": {
+                "type": "string",
+                "minLength": 1
+              },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "pathType": {
+                      "type": "string",
+                      "enum": ["ImplementationSpecific", "Prefix", "Exact"]
+                    }
+                  },
+                  "required": ["path"],
+                  "additionalProperties": true
+                }
+              }
+            },
+            "required": ["host", "paths"],
+            "additionalProperties": true
+          }
+        },
+        "tls": {
+          "type": "array"
+        }
+      },
+      "additionalProperties": true
+    },
+    "app": {
+      "type": "object",
+      "properties": {
+        "logs_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state_file_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "read_existing_on_startup": {
+          "type": "boolean"
+        },
+        "read_chunk_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_line_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_concurrent_file_readers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "logging": {
+          "type": "object",
+          "properties": {
+            "log_level": {
+              "type": "string"
+            },
+            "log_format": {
+              "type": "string"
+            }
+          },
+          "required": ["log_level", "log_format"],
+          "additionalProperties": true
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/"
+            }
+          },
+          "required": ["enabled", "port", "path"],
+          "additionalProperties": true
+        },
+        "channels": {
+          "type": "object",
+          "properties": {
+            "watcher_buffer_size": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "es_buffer_size": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "backpressure_threshold": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "backpressure_min_delay_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "backpressure_max_delay_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "notify_buffer_warning_threshold": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "notify_buffer_max_size": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "notify_drop_on_overflow": {
+              "type": "boolean"
+            },
+            "notify_filesystem_buffer_warning_threshold": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "notify_filesystem_buffer_size": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": true
+        },
+        "elasticsearch": {
+          "type": "object",
+          "properties": {
+            "host": {
+              "type": "string",
+              "pattern": "^https?://"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "index_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "flush_interval": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "bulk_size": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "workers": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": ["host", "port", "index_name", "flush_interval", "bulk_size", "workers"],
+          "additionalProperties": true
+        }
+      },
+      "required": ["logs_path", "metrics", "logging", "channels", "elasticsearch"],
+      "additionalProperties": true
+    }
+  },
+  "required": ["image", "service", "hostPath", "app"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "ingress": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            },
+            "required": ["enabled"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "app": {
+            "properties": {
+              "metrics": {
+                "properties": {
+                  "enabled": {
+                    "const": true
+                  }
+                },
+                "required": ["enabled"]
+              }
+            },
+            "required": ["metrics"]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true
+}

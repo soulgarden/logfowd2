@@ -22,7 +22,17 @@ data:
         "es_buffer_size": {{ .Values.app.channels.es_buffer_size }},
         "backpressure_threshold": {{ .Values.app.channels.backpressure_threshold }},
         "backpressure_min_delay_ms": {{ .Values.app.channels.backpressure_min_delay_ms | default 5 }},
-        "backpressure_max_delay_ms": {{ .Values.app.channels.backpressure_max_delay_ms | default 60 }}
+        "backpressure_max_delay_ms": {{ .Values.app.channels.backpressure_max_delay_ms | default 60 }},
+        "notify_buffer_warning_threshold": {{ .Values.app.channels.notify_buffer_warning_threshold | default 1000 }},
+        "notify_buffer_max_size": {{ .Values.app.channels.notify_buffer_max_size | default 10000 }},
+        "notify_drop_on_overflow": {{ .Values.app.channels.notify_drop_on_overflow | default true }},
+        "notify_filesystem_buffer_warning_threshold": {{ .Values.app.channels.notify_filesystem_buffer_warning_threshold | default 1000 }},
+        "notify_filesystem_buffer_size": {{ .Values.app.channels.notify_filesystem_buffer_size | default 1024 }}
+      },
+      "metrics": {
+        "enabled": {{ .Values.app.metrics.enabled | default false }},
+        "port": {{ .Values.app.metrics.port | default 9090 }},
+        "path": "{{ .Values.app.metrics.path | default "/metrics" }}"
       },
       "es": {
         "host": "{{ .Values.app.elasticsearch.host }}",
