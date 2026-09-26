@@ -119,7 +119,7 @@ impl MetadataCache {
         if self.cache.len() >= self.max_size {
             let oldest_keys: Vec<String> = {
                 let mut entries: Vec<_> = self.cache.iter().collect();
-                entries.sort_by(|a, b| a.1.cached_at.cmp(&b.1.cached_at));
+                entries.sort_by_key(|entry| entry.1.cached_at);
 
                 let remove_count = (self.cache.len() - self.max_size + 1).min(self.cache.len() / 4);
                 entries

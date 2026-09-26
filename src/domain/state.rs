@@ -281,7 +281,13 @@ impl AppState {
     fn calculate_checksum(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let digest = hasher.finalize();
+        let mut checksum = String::with_capacity(digest.len() * 2);
+        use std::fmt::Write;
+        for byte in digest.iter() {
+            write!(&mut checksum, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        checksum
     }
 
     /// Create an efficient clone for save operations
@@ -400,7 +406,7 @@ mod tests {
 
         let main = NamedTempFile::new().unwrap();
         let main_path = main.path().to_str().unwrap().to_string();
-        let backup_path = format!("{}.backup", &main_path);
+        let backup_path = format!("{}.backup", main_path);
 
         // Write valid backup
         state.save_to_file(&backup_path).unwrap();
@@ -417,7 +423,7 @@ mod tests {
     fn test_new_state_when_both_main_and_backup_corrupted() {
         let main = NamedTempFile::new().unwrap();
         let main_path = main.path().to_str().unwrap().to_string();
-        let backup_path = format!("{}.backup", &main_path);
+        let backup_path = format!("{}.backup", main_path);
 
         // Corrupt both files
         std::fs::write(&main_path, b"{broken}").unwrap();
@@ -527,6 +533,14 @@ mod tests {
 
         assert_eq!(checksum1, checksum2, "Checksums should be identical");
         assert_eq!(checksum2, checksum3, "Checksums should be identical");
+    }
+
+    #[test]
+    fn test_checksum_matches_sha256_hex() {
+        assert_eq!(
+            AppState::calculate_checksum("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]

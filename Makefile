@@ -10,22 +10,22 @@ fmt:
 	cargo fmt --all
 
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 
 lint_fix:
-	cargo clippy --all-targets --fix --allow-dirty -- -D warnings
+	cargo clippy --locked --all-targets --fix --allow-dirty -- -D warnings
 
 test:
-	cargo test -- --test-threads=1
+	cargo test --locked -- --test-threads=1
 
 check:
-	cargo check
+	cargo check --locked
 
 build_dev:
-	cargo build
+	cargo build --locked
 
 build_release:
-	cargo build --release
+	cargo build --locked --release
 
 # Validate Helm charts
 helm_validate:

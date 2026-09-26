@@ -1,21 +1,19 @@
-FROM rust:1.93.1-alpine AS builder
+FROM rust:1.98.1-alpine3.24 AS builder
 
-RUN apk add --no-cache musl-dev pkgconfig gcc make && \
-    rustup target add x86_64-unknown-linux-musl
+RUN apk add --no-cache pkgconfig make
 
-COPY . /tmp/rust/src/github.com/soulgarden/logfowd2
+WORKDIR /app
 
-WORKDIR /tmp/rust/src/github.com/soulgarden/logfowd2
+COPY Cargo.toml Cargo.lock ./
+COPY src/ ./src/
 
-RUN cargo build --target=x86_64-unknown-linux-musl --release
+RUN cargo build --locked --release
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 RUN adduser -S www-data -G www-data
 
-COPY --from=builder --chown=www-data /tmp/rust/src/github.com/soulgarden/logfowd2/target/x86_64-unknown-linux-musl/release/logfowd2 /bin/logfowd2
-
-RUN chmod +x /bin/logfowd2
+COPY --from=builder --chmod=0555 /app/target/release/logfowd2 /bin/logfowd2
 
 USER www-data
 
