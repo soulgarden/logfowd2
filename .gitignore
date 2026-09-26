@@ -4,6 +4,7 @@
 !/.dockerignore
 !/.gitignore
 !/.github/
+!/.github/dependabot.yml
 !/.github/workflows/
 !/.github/workflows/main.yml
 !/Cargo.toml
