@@ -7,7 +7,7 @@ networks:
 services:
   elasticsearch-master:
     container_name: elasticsearch-master
-    image: elasticsearch:7.16.2
+    image: elasticsearch:9.5.3
     restart: always
     environment:
       cluster.name: elasticsearch
