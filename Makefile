@@ -10,27 +10,27 @@ fmt:
 	cargo fmt --all
 
 lint:
-	cargo clippy --all-targets -- -D warnings
+	cargo clippy --locked --all-targets -- -D warnings
 
 lint_fix:
-	cargo clippy --all-targets --fix --allow-dirty -- -D warnings
+	cargo clippy --locked --all-targets --fix --allow-dirty -- -D warnings
 
 test:
-	cargo test -- --test-threads=1
+	cargo test --locked -- --test-threads=1
 
 check:
-	cargo check
+	cargo check --locked
 
 build_dev:
-	cargo build
+	cargo build --locked
 
 build_release:
-	cargo build --release
+	cargo build --locked --release
 
 # Validate Helm charts
 helm_validate:
-	helm lint helm/logfowd2
-	helm template logfowd helm/logfowd2 --validate --dry-run
+	helm lint --strict helm/logfowd2
+	helm template logfowd helm/logfowd2 >/dev/null
 
 # Run all development checks (format, lint_fix, test, build, helm validation)
 dev_check: fmt lint_fix test check build_dev helm_validate
@@ -56,10 +56,10 @@ increment-version:
 
 # Docker Commands
 docker_up du:
-	docker-compose up -d --build
+	docker compose up -d --build
 
 docker_down dd:
-	docker-compose down
+	docker compose down
 
 # Build and push Docker image with version from VERSION file
 docker-build db:

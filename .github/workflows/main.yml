@@ -14,11 +14,14 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.93.1
+        uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: 1.98.1
           components: rustfmt, clippy
 
       - name: Check formatting
@@ -30,46 +33,52 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@1.93.1
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: 1.98.1
 
       - name: Cache cargo dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rust-1.93.1-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-rust-1.98.1-${{ hashFiles('Cargo.lock') }}
 
       - name: Run tests
-        run: cargo test -- --test-threads=1
+        run: cargo test --locked -- --test-threads=1
 
   build:
     needs: [lint, test]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Get version
         id: version
-        run: echo "VERSION=$(cat VERSION)" >> $GITHUB_OUTPUT
+        run: echo "VERSION=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Login to Docker Hub
         if: ${{ env.DO_PUSH == 'true' }}
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4.6.0
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4.4.1
 
       - name: Build Docker image (PR/branch)
         if: ${{ env.DO_PUSH == 'false' }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -80,7 +89,7 @@ jobs:
 
       - name: Build and push Docker image (main)
         if: ${{ env.DO_PUSH == 'true' }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7.4.0
         with:
           context: .
           file: Dockerfile
@@ -88,5 +97,5 @@ jobs:
           tags: |
             ${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:${{ steps.version.outputs.VERSION }}
             ${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:latest
-          cache-from: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:latest
-          cache-to: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:latest,mode=max
+          cache-from: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:build-cache
+          cache-to: type=registry,ref=${{ secrets.DOCKER_HUB_USERNAME }}/logfowd2:build-cache,mode=max

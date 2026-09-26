@@ -114,4 +114,4 @@ Kube-linter check used in this project:
 kube-linter lint helm/logfowd2 --exclude run-as-non-root --exclude no-read-only-root-fs
 ```
 
-For local development, Rust `1.93.1` is pinned in `rust-toolchain.toml`.
+For local development, Rust `1.98.1` is pinned in `rust-toolchain.toml`.
