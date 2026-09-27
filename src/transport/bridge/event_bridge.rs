@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::{debug, warn};
 
 use crate::domain::event::Event;
@@ -9,13 +9,10 @@ use crate::infrastructure::metrics::metrics;
 use crate::transport::channels::{BoundedSender, SendError};
 
 /// EventBridge provides a two-tier channel architecture to prevent notify callback blocking.
-/// It uses an unbounded channel for the notify callback and bridges to a bounded channel
-/// with proper backpressure handling and metrics.
+/// Both sides are bounded so a slow Elasticsearch endpoint backpressures file reading.
 pub struct EventBridge {
-    /// Unbounded sender for notify callback - never blocks
-    notify_sender: UnboundedSender<Event>,
-    /// Unbounded receiver for bridge task
-    notify_receiver: Option<UnboundedReceiver<Event>>,
+    notify_sender: Sender<Event>,
+    notify_receiver: Option<Receiver<Event>>,
     /// Configuration parameters
     config: EventBridgeConfig,
     /// Metrics enabled flag
@@ -25,6 +22,7 @@ pub struct EventBridge {
 /// Configuration for EventBridge behavior
 #[derive(Clone, Debug)]
 pub struct EventBridgeConfig {
+    pub buffer_size: usize,
     /// Warning threshold for unbounded queue size
     pub notify_buffer_warning_threshold: usize,
     /// Interval for logging queue size warnings
@@ -34,6 +32,7 @@ pub struct EventBridgeConfig {
 impl Default for EventBridgeConfig {
     fn default() -> Self {
         Self {
+            buffer_size: 10_000,
             notify_buffer_warning_threshold: 1000,
             warning_log_interval: Duration::from_secs(30),
         }
@@ -43,7 +42,7 @@ impl Default for EventBridgeConfig {
 impl EventBridge {
     /// Create new EventBridge with configuration
     pub fn new(config: EventBridgeConfig, metrics_enabled: bool) -> Self {
-        let (notify_sender, notify_receiver) = unbounded_channel();
+        let (notify_sender, notify_receiver) = channel(config.buffer_size.max(1));
 
         Self {
             notify_sender,
@@ -92,7 +91,7 @@ impl EventBridge {
 
     /// Internal bridge task that forwards events with backpressure handling
     async fn bridge_task(
-        mut receiver: UnboundedReceiver<Event>,
+        mut receiver: Receiver<Event>,
         mut bounded_sender: BoundedSender<Event>,
         config: EventBridgeConfig,
         metrics_enabled: bool,
@@ -218,23 +217,16 @@ impl EventBridge {
 
 /// Sender wrapper for the notify callback that provides try_send with never-blocking behavior
 pub struct NotifyEventSender {
-    sender: UnboundedSender<Event>,
+    sender: Sender<Event>,
     #[allow(dead_code)]
     config: EventBridgeConfig,
     metrics_enabled: bool,
 }
 
 impl NotifyEventSender {
-    /// Try to send event - never blocks, uses unbounded channel
-    pub fn try_send(&mut self, event: Event) -> Result<(), NotifyEventSendError> {
-        // Since we can't track actual queue size with tokio's UnboundedSender,
-        // we'll rely on the bounded channel downstream to provide backpressure.
-        // This simplifies the implementation while still preventing notify thread blocking.
-
-        // Try to send
-        match self.sender.send(event) {
+    pub async fn send(&self, event: Event) -> Result<(), NotifyEventSendError> {
+        match self.sender.send(event).await {
             Ok(()) => {
-                // Update metrics
                 if self.metrics_enabled {
                     metrics()
                         .events_processed_total
@@ -255,12 +247,10 @@ impl NotifyEventSender {
         }
     }
 
-    /// Get current queue size for monitoring - not available for unbounded channels
+    /// Get current queue size for monitoring.
     #[allow(dead_code)]
     pub fn queue_size(&self) -> usize {
-        // UnboundedSender doesn't provide len(), so we can't track actual queue size
-        // This is a limitation we accept for the benefit of never blocking the notify callback
-        0
+        self.sender.max_capacity() - self.sender.capacity()
     }
 }
 
@@ -302,14 +292,13 @@ mod tests {
         let config = EventBridgeConfig::default();
         let bridge = EventBridge::new(config.clone(), false);
 
-        let mut notify_sender = bridge.notify_sender();
+        let notify_sender = bridge.notify_sender();
 
         // Should be able to send events
         let event = Event::new("test".to_string(), Meta::default());
-        assert!(notify_sender.try_send(event).is_ok());
+        assert!(notify_sender.send(event).await.is_ok());
 
-        // Queue size is not trackable with UnboundedSender
-        assert_eq!(notify_sender.queue_size(), 0);
+        assert_eq!(notify_sender.queue_size(), 1);
     }
 
     #[tokio::test]
@@ -317,16 +306,15 @@ mod tests {
         let config = EventBridgeConfig::default();
 
         let bridge = EventBridge::new(config, false);
-        let mut notify_sender = bridge.notify_sender();
+        let notify_sender = bridge.notify_sender();
 
         // Should be able to send events without blocking
         for i in 0..10 {
             let event = Event::new(format!("test {}", i), Meta::default());
-            assert!(notify_sender.try_send(event).is_ok());
+            assert!(notify_sender.send(event).await.is_ok());
         }
 
-        // UnboundedSender should never block or return QueueFull
-        // The backpressure handling happens downstream in the EventBridge task
+        // The configured buffer has enough room for this short burst.
     }
 
     #[tokio::test]
@@ -349,10 +337,10 @@ mod tests {
         time::sleep(Duration::from_millis(10)).await;
 
         // Get notify sender and send event
-        let mut notify_sender = bridge.notify_sender();
+        let notify_sender = bridge.notify_sender();
         let test_event = Event::new("test message".to_string(), Meta::default());
 
-        notify_sender.try_send(test_event.clone()).unwrap();
+        notify_sender.send(test_event.clone()).await.unwrap();
 
         // Event should be forwarded to bounded channel
         let received = bounded_receiver.recv().await.unwrap();
@@ -377,10 +365,10 @@ mod tests {
         let _bridge_handle = bridge.start_bridge_task(bounded_sender, shutdown_notify.clone());
 
         // Send some events
-        let mut notify_sender = bridge.notify_sender();
+        let notify_sender = bridge.notify_sender();
         for i in 0..3 {
             let event = Event::new(format!("message {}", i), Meta::default());
-            notify_sender.try_send(event).unwrap();
+            notify_sender.send(event).await.unwrap();
         }
 
         // Give the bridge task some time to process events
@@ -410,13 +398,13 @@ mod tests {
         let bridge = EventBridge::new(config, false);
 
         let notify_sender1 = bridge.notify_sender();
-        let mut notify_sender2 = notify_sender1.clone();
+        let notify_sender2 = notify_sender1.clone();
 
         // Both should work independently
         let event1 = Event::new("from sender 1".to_string(), Meta::default());
         let event2 = Event::new("from sender 2".to_string(), Meta::default());
 
-        assert!(notify_sender1.sender.send(event1).is_ok());
-        assert!(notify_sender2.try_send(event2).is_ok());
+        assert!(notify_sender1.send(event1).await.is_ok());
+        assert!(notify_sender2.send(event2).await.is_ok());
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, MutexGuard, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -43,6 +43,7 @@ pub struct DeadLetterQueue {
     config: DeadLetterQueueConfig,
     queue: Arc<RwLock<VecDeque<DeadLetter>>>,
     stats: Arc<RwLock<DeadLetterStats>>,
+    persistence_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Default)]
@@ -63,7 +64,12 @@ impl DeadLetterQueue {
             config,
             queue,
             stats,
+            persistence_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub async fn lock_retry(&self) -> MutexGuard<'_, ()> {
+        self.persistence_lock.lock().await
     }
 
     pub async fn add_failed_event(&self, event: Event, failure_reason: String) {
@@ -189,13 +195,10 @@ impl DeadLetterQueue {
     }
 
     pub async fn flush_to_disk(&self) -> Result<(), std::io::Error> {
+        let _guard = self.persistence_lock.lock().await;
         if let Some(ref file_path) = self.config.persistence_file {
             let queue = self.queue.read().await;
             let data: Vec<DeadLetter> = queue.iter().cloned().collect();
-
-            if data.is_empty() {
-                return Ok(());
-            }
 
             let json_data = serde_json::to_string_pretty(&data)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -260,6 +263,7 @@ impl DeadLetterQueue {
         let queue_clone = Arc::clone(&self.queue);
         let config_clone = self.config.clone();
         let stats_clone = Arc::clone(&self.stats); // Share the same stats instance for consistency
+        let persistence_lock = Arc::clone(&self.persistence_lock);
 
         // Periodic flush task
         tokio::spawn(async move {
@@ -272,6 +276,7 @@ impl DeadLetterQueue {
                             config: config_clone.clone(),
                             queue: queue_clone.clone(),
                             stats: stats_clone.clone(), // Use shared stats to maintain consistency
+                            persistence_lock: persistence_lock.clone(),
                         };
 
                         if let Err(e) = dlq.flush_to_disk().await {
@@ -299,6 +304,7 @@ impl DeadLetterQueue {
                             config: config_clone.clone(),
                             queue: queue_clone.clone(),
                             stats: stats_clone.clone(),
+                            persistence_lock: persistence_lock.clone(),
                         };
 
                         if let Err(e) = dlq.flush_to_disk().await {
@@ -452,10 +458,55 @@ mod tests {
         let result = dlq.flush_to_disk().await;
         assert!(result.is_ok());
 
-        // File should not be created for empty queue
+        assert_eq!(std::fs::read_to_string(temp_file.path()).unwrap(), "[]");
+    }
+
+    #[tokio::test]
+    async fn test_flush_clears_recovered_events_from_disk() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = create_test_config_with_file(path.clone());
+        let dlq = DeadLetterQueue::new(config.clone());
+        dlq.add_failed_event(create_test_event("once"), "failed".to_string())
+            .await;
+        dlq.flush_to_disk().await.unwrap();
+
+        let recovered = dlq.take_batch(1).await;
+        assert_eq!(recovered.len(), 1);
+        dlq.mark_recovered(1).await;
+        dlq.flush_to_disk().await.unwrap();
+
+        let restored = DeadLetterQueue::new(config);
+        restored.load_from_disk().await.unwrap();
+        assert!(restored.take_batch(1).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flush_waits_while_retry_batch_is_in_flight() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_string_lossy().to_string();
+        let config = create_test_config_with_file(path.clone());
+        let dlq = Arc::new(DeadLetterQueue::new(config.clone()));
+        dlq.add_failed_event(create_test_event("pending"), "failed".to_string())
+            .await;
+        dlq.flush_to_disk().await.unwrap();
+
+        let retry_guard = dlq.lock_retry().await;
+        let batch = dlq.take_batch(1).await;
+        let flush_dlq = dlq.clone();
+        let mut flush = tokio::spawn(async move { flush_dlq.flush_to_disk().await });
         assert!(
-            !temp_file.path().exists() || std::fs::metadata(temp_file.path()).unwrap().len() == 0
+            tokio::time::timeout(Duration::from_millis(20), &mut flush)
+                .await
+                .is_err()
         );
+        dlq.return_failed(batch).await;
+        drop(retry_guard);
+        flush.await.unwrap().unwrap();
+
+        let restored = DeadLetterQueue::new(config);
+        restored.load_from_disk().await.unwrap();
+        assert_eq!(restored.take_batch(1).await.len(), 1);
     }
 
     #[tokio::test]

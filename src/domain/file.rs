@@ -7,7 +7,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom
 
 use tracing::{debug, error, info, warn};
 
-use crate::domain::event::{Event, Meta};
+use crate::domain::event::{Event, Meta, SourcePosition};
 use crate::domain::state::AppState;
 use crate::infrastructure::filesystem::metadata_cache::{FileMetadata, MetadataCache};
 
@@ -79,7 +79,7 @@ impl FileTracker {
             .as_secs();
 
         // Check if we have previous state for this file
-        let position = if app_state.should_reopen_file(&path, inode) {
+        let mut position = if app_state.should_reopen_file(&path, inode) {
             // New file or rotated file - start from beginning or saved position
             app_state.add_file(path.clone(), inode, size, last_modified);
             app_state.get_file_position(&path).unwrap_or(0)
@@ -95,6 +95,7 @@ impl FileTracker {
                 path
             );
             app_state.handle_file_truncation(&path);
+            position = 0;
         }
 
         let mut file = match File::open(&actual_path).await {
@@ -198,11 +199,20 @@ impl FileTracker {
                     }
                 }
 
-                if !line.is_empty() {
-                    events.push(Event::new(line.clone(), self.meta.clone()));
-                }
-
                 self.position += bytes_read as u64;
+
+                if !line.is_empty() {
+                    app_state.register_pending(&self.path, self.inode, self.position);
+                    events.push(Event::from_file(
+                        line.clone(),
+                        self.meta.clone(),
+                        SourcePosition {
+                            path: self.path.clone(),
+                            inode: self.inode,
+                            end: self.position,
+                        },
+                    ));
+                }
             }
 
             // If we stopped early due to limit, BufReader may have read ahead.
@@ -417,6 +427,20 @@ impl FileTracker {
                 self.inode = metadata.ino();
                 self.last_size = metadata.len();
 
+                if app_state.should_reopen_file(&self.path, self.inode) {
+                    let last_modified = metadata
+                        .modified()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    app_state.add_file(
+                        self.path.clone(),
+                        self.inode,
+                        self.last_size,
+                        last_modified,
+                    );
+                }
+
                 // Start from saved position or beginning
                 let saved_position = app_state.get_file_position(&self.path).unwrap_or(0);
                 self.position = saved_position;
@@ -548,53 +572,45 @@ impl FileTracker {
         })
     }
 
-    /// Read a single line with size limitation to prevent OOM from very long log lines
-    /// Optimized version using read_until to minimize syscalls
+    /// Keep only the configured prefix while consuming the whole line.
     async fn read_line_limited_static<R: AsyncBufReadExt + Unpin>(
         max_line_size: usize,
         path: &str,
         reader: &mut R,
         line: &mut String,
     ) -> Result<usize, std::io::Error> {
-        // Pre-allocate buffer with reasonable capacity
-        let mut buffer = Vec::with_capacity(std::cmp::min(max_line_size + 16, 8192));
+        let mut buffer = Vec::with_capacity(max_line_size.min(8192));
+        let mut bytes_read = 0;
+        let mut saw_newline = false;
 
-        let bytes_read = match reader.read_until(b'\n', &mut buffer).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                // Handle read errors gracefully
-                match e.kind() {
-                    std::io::ErrorKind::InvalidData => {
-                        warn!("Invalid data encountered while reading {}: {}", path, e);
-                        line.push_str(" [READ_ERROR]");
-                        return Ok(0);
-                    }
-                    std::io::ErrorKind::UnexpectedEof => {
-                        warn!(
-                            "Unexpected EOF while reading {}, file may be truncated",
-                            path
-                        );
-                        // Try to process what we have in the buffer
-                        if !buffer.is_empty() {
-                            let line_content = Self::sanitize_corrupted_content(&buffer, path);
-                            line.push_str(&line_content);
-                        }
-                        return Ok(buffer.len());
-                    }
-                    _ => {
-                        warn!("Read error in {}: {}", path, e);
-                        return Err(e);
-                    }
-                }
+        loop {
+            let available = reader.fill_buf().await.map_err(|e| {
+                warn!("Read error in {}: {}", path, e);
+                e
+            })?;
+            if available.is_empty() {
+                break;
             }
-        };
+
+            let count = available
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(available.len(), |index| index + 1);
+            let remaining = max_line_size.saturating_sub(buffer.len());
+            buffer.extend_from_slice(&available[..count.min(remaining)]);
+            saw_newline = available[count - 1] == b'\n';
+            reader.consume(count);
+            bytes_read += count;
+            if saw_newline {
+                break;
+            }
+        }
 
         if bytes_read == 0 {
             return Ok(0); // EOF
         }
 
-        // Handle line size limiting
-        if buffer.len() > max_line_size {
+        if bytes_read > max_line_size {
             // Truncate to max_line_size with UTF-8 safety
             let mut safe_end = std::cmp::min(max_line_size, buffer.len());
 
@@ -617,11 +633,7 @@ impl FileTracker {
             );
             line.push_str("... [TRUNCATED]");
 
-            // If we didn't find a newline (line was truncated), we need to skip to the next newline
-            if buffer.last() != Some(&b'\n') {
-                Self::skip_to_newline(reader).await?;
-            } else {
-                // Add the newline that we found
+            if saw_newline {
                 line.push('\n');
             }
         } else {
@@ -631,29 +643,6 @@ impl FileTracker {
         }
 
         Ok(bytes_read)
-    }
-
-    /// Skip reading until we find a newline character
-    async fn skip_to_newline<R: AsyncBufReadExt + Unpin>(
-        reader: &mut R,
-    ) -> Result<(), std::io::Error> {
-        use tokio::io::AsyncReadExt;
-
-        let mut byte_buffer = [0u8; 1];
-        loop {
-            match reader.read(&mut byte_buffer).await {
-                Ok(0) => break, // EOF
-                Ok(1) => {
-                    if byte_buffer[0] == b'\n' {
-                        break; // Found newline, stop skipping
-                    }
-                    // Continue skipping
-                }
-                Ok(_) => break,  // Unexpected read size
-                Err(_) => break, // Any error, just stop
-            }
-        }
-        Ok(())
     }
 
     /// Sanitize potentially corrupted content from log files
@@ -1029,6 +1018,32 @@ mod tests {
 
         // Position should be at end of file
         assert!(tracker.position > 0);
+    }
+
+    #[tokio::test]
+    async fn test_restart_before_delivery_replays_unacknowledged_line() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("pod.log");
+        let state_path = dir.path().join("state.json");
+        fs::write(&log_path, "not delivered yet\n").unwrap();
+        let path = log_path.to_string_lossy().to_string();
+        let mut state = AppState::new();
+
+        let mut tracker = FileTracker::new(path.clone(), create_test_meta(), &mut state)
+            .await
+            .unwrap();
+        let pending = tracker.read_new_lines(&mut state).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        state.save_to_file(state_path.to_str().unwrap()).unwrap();
+        drop(tracker);
+
+        let mut restored = AppState::load_from_file(state_path.to_str().unwrap()).unwrap();
+        let mut tracker = FileTracker::new(path, create_test_meta(), &mut restored)
+            .await
+            .unwrap();
+        let replayed = tracker.read_new_lines(&mut restored).await.unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].message, pending[0].message);
     }
 
     #[tokio::test]
@@ -1498,6 +1513,32 @@ mod tests {
         let second_event = &events[1];
         assert_eq!(second_event.message, "normal line");
         assert!(!second_event.message.contains("TRUNCATED"));
+    }
+
+    #[tokio::test]
+    async fn test_line_far_above_limit_preserves_following_line() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.log");
+        let max_line_size = 1024;
+        let mut content = vec![b'x'; 4 * 1024 * 1024];
+        content.extend_from_slice(b"\nfollowing line\n");
+        fs::write(&path, content).unwrap();
+
+        let mut state = AppState::new();
+        let mut tracker = FileTracker::new_with_max_line_size(
+            path.to_string_lossy().to_string(),
+            create_test_meta(),
+            &mut state,
+            max_line_size,
+        )
+        .await
+        .unwrap();
+        let events = tracker.read_new_lines(&mut state).await.unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(events[0].message.starts_with(&"x".repeat(max_line_size)));
+        assert!(events[0].message.ends_with("... [TRUNCATED]"));
+        assert_eq!(events[1].message, "following line");
     }
 
     #[tokio::test]

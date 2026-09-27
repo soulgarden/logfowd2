@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
     let sender = Sender::new(conf.clone(), es_process_queue_receiver, es_queue_sender);
 
     let mut watcher = Watcher::new(conf.clone(), es_process_queue_sender);
+    let app_state = watcher.state_handle();
 
     // Create metrics server
     let metrics_config = conf.metrics.clone().unwrap_or_default();
@@ -137,7 +138,9 @@ async fn main() -> Result<()> {
                 sender.run(sender_shutdown_notify).await
             },
             async move {
-                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver).await?;
+                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
+                    .await?
+                    .with_app_state(app_state);
                 worker_pool.run(es_shutdown_notify).await
             },
             async move {
@@ -164,7 +167,9 @@ async fn main() -> Result<()> {
                 sender.run(sender_shutdown_notify).await
             },
             async move {
-                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver).await?;
+                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
+                    .await?
+                    .with_app_state(app_state);
                 worker_pool.run(es_shutdown_notify).await
             },
             // Dummy future to maintain same tuple structure

@@ -20,6 +20,10 @@ pub struct AppState {
     pub files: HashMap<String, FileState>,
     pub version: u32,
     pub checksum: Option<String>,
+    #[serde(skip)]
+    committed: HashMap<String, u64>,
+    #[serde(skip)]
+    pending: HashMap<String, BTreeMap<u64, bool>>,
 }
 
 #[derive(Debug)]
@@ -37,6 +41,8 @@ impl AppState {
             files: HashMap::new(),
             version: 1,
             checksum: None,
+            committed: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -109,6 +115,11 @@ impl AppState {
         // Update checksum to current format using deterministic calculation
         let content_for_checksum = Self::create_content_without_checksum(&state)?;
         state.checksum = Some(Self::calculate_checksum(&content_for_checksum));
+        state.committed = state
+            .files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.position))
+            .collect();
         Ok(state)
     }
 
@@ -118,7 +129,7 @@ impl AppState {
 
     pub fn save_to_file_atomic(&self, state_file_path: &str) -> Result<(), StateError> {
         // Create a copy with updated checksum
-        let mut state_copy = self.clone();
+        let mut state_copy = self.clone_for_save();
 
         // Create content without checksum for checksum calculation
         let content_for_checksum = Self::create_content_without_checksum(&state_copy)?;
@@ -223,10 +234,52 @@ impl AppState {
         };
 
         self.files.insert(file_path.clone(), file_state);
+        self.committed.insert(file_path.clone(), 0);
+        self.pending.remove(&file_path);
         debug!("Added file to state: {}", file_path);
     }
 
+    pub fn register_pending(&mut self, file_path: &str, inode: u64, end_position: u64) {
+        if self
+            .files
+            .get(file_path)
+            .is_some_and(|file| file.inode == inode)
+            && end_position > *self.committed.get(file_path).unwrap_or(&0)
+        {
+            self.pending
+                .entry(file_path.to_string())
+                .or_default()
+                .entry(end_position)
+                .or_insert(false);
+        }
+    }
+
+    pub fn mark_delivered(&mut self, file_path: &str, inode: u64, end_position: u64) {
+        if !self
+            .files
+            .get(file_path)
+            .is_some_and(|file| file.inode == inode)
+        {
+            return;
+        }
+        let Some(pending) = self.pending.get_mut(file_path) else {
+            return;
+        };
+        let Some(acked) = pending.get_mut(&end_position) else {
+            return;
+        };
+        *acked = true;
+
+        while pending.first_key_value().is_some_and(|(_, acked)| *acked) {
+            if let Some((position, _)) = pending.pop_first() {
+                self.committed.insert(file_path.to_string(), position);
+            }
+        }
+    }
+
     pub fn remove_file(&mut self, file_path: &str) {
+        self.committed.remove(file_path);
+        self.pending.remove(file_path);
         if self.files.remove(file_path).is_some() {
             debug!("Removed file from state: {}", file_path);
         }
@@ -246,6 +299,8 @@ impl AppState {
                 file_path, file_state.position
             );
             file_state.position = 0;
+            self.committed.insert(file_path.to_string(), 0);
+            self.pending.remove(file_path);
         }
     }
 
@@ -292,7 +347,12 @@ impl AppState {
 
     /// Create an efficient clone for save operations
     pub fn clone_for_save(&self) -> Self {
-        self.clone()
+        let mut snapshot = self.clone();
+        for (path, file) in &mut snapshot.files {
+            file.position = *self.committed.get(path).unwrap_or(&0);
+        }
+        snapshot.pending.clear();
+        snapshot
     }
 
     /// Get a specific file state without holding a long-term lock
@@ -325,6 +385,8 @@ mod tests {
         let mut state = AppState::new();
         state.add_file("/test/file.log".to_string(), 12345, 1000, 1234567890);
         state.update_file_position("/test/file.log".to_string(), 500);
+        state.register_pending("/test/file.log", 12345, 500);
+        state.mark_delivered("/test/file.log", 12345, 500);
 
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_str().unwrap();
@@ -336,6 +398,32 @@ mod tests {
         let loaded_state = AppState::load_from_file(path).unwrap();
 
         assert_eq!(loaded_state.get_file_position("/test/file.log"), Some(500));
+    }
+
+    #[test]
+    fn test_checkpoint_waits_for_contiguous_acknowledgements() {
+        let mut state = AppState::new();
+        state.add_file("/test/file.log".to_string(), 12345, 200, 1234567890);
+        state.update_file_position("/test/file.log".to_string(), 200);
+        state.register_pending("/test/file.log", 12345, 100);
+        state.register_pending("/test/file.log", 12345, 200);
+        state.mark_delivered("/test/file.log", 12345, 200);
+        assert_eq!(
+            state.clone_for_save().get_file_position("/test/file.log"),
+            Some(0)
+        );
+
+        state.mark_delivered("/test/file.log", 99999, 100);
+        assert_eq!(
+            state.clone_for_save().get_file_position("/test/file.log"),
+            Some(0)
+        );
+
+        state.mark_delivered("/test/file.log", 12345, 100);
+        assert_eq!(
+            state.clone_for_save().get_file_position("/test/file.log"),
+            Some(200)
+        );
     }
 
     #[test]
@@ -403,6 +491,8 @@ mod tests {
         let mut state = AppState::new();
         state.add_file("/file.log".to_string(), 1, 10, 100);
         state.update_file_position("/file.log".to_string(), 5);
+        state.register_pending("/file.log", 1, 5);
+        state.mark_delivered("/file.log", 1, 5);
 
         let main = NamedTempFile::new().unwrap();
         let main_path = main.path().to_str().unwrap().to_string();
@@ -548,6 +638,8 @@ mod tests {
         let mut state = AppState::new();
         state.add_file("/test/file.log".to_string(), 12345, 1000, 1234567890);
         state.update_file_position("/test/file.log".to_string(), 500);
+        state.register_pending("/test/file.log", 12345, 500);
+        state.mark_delivered("/test/file.log", 12345, 500);
 
         let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path().to_str().unwrap();

@@ -6,6 +6,15 @@ pub struct Event {
     pub message: String,
     pub timestamp: DateTime<Utc>,
     pub meta: Meta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourcePosition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SourcePosition {
+    pub path: String,
+    pub inode: u64,
+    pub end: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -22,7 +31,14 @@ impl Event {
             message,
             timestamp: Utc::now(),
             meta,
+            source: None,
         }
+    }
+
+    pub fn from_file(message: String, meta: Meta, source: SourcePosition) -> Self {
+        let mut event = Self::new(message, meta);
+        event.source = Some(source);
+        event
     }
 }
 
@@ -245,18 +261,21 @@ mod tests {
             message: "Test message".to_string(),
             timestamp,
             meta: meta.clone(),
+            source: None,
         };
 
         let event2 = Event {
             message: "Test message".to_string(),
             timestamp,
             meta: meta.clone(),
+            source: None,
         };
 
         let event3 = Event {
             message: "Different message".to_string(),
             timestamp,
             meta,
+            source: None,
         };
 
         assert_eq!(event1, event2);
