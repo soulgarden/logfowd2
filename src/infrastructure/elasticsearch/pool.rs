@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -5,13 +6,15 @@ use async_trait::async_trait;
 use bytes::BufMut;
 use chrono::Utc;
 use reqwest::Client;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Settings;
 use crate::domain::event::Event;
+use crate::domain::state::AppState;
 use crate::error::{EsError, Result};
+use crate::infrastructure::elasticsearch::bulk::failed_items;
 use crate::infrastructure::elasticsearch::circuit_breaker::{
     CircuitBreaker, CircuitBreakerError, create_es_circuit_breaker,
 };
@@ -27,6 +30,7 @@ pub struct EsWorkerPool {
     es_queue_receiver: BoundedReceiver<Vec<Event>>,
     dead_letter_queue: Arc<DeadLetterQueue>,
     conf: Settings,
+    app_state: Option<Arc<RwLock<AppState>>>,
 }
 
 struct EsWorker {
@@ -37,6 +41,19 @@ struct EsWorker {
     circuit_breaker: CircuitBreaker,
     dead_letter_queue: Arc<DeadLetterQueue>,
     network_stats: NetworkStats,
+    app_state: Option<Arc<RwLock<AppState>>>,
+}
+
+async fn acknowledge_events(app_state: Option<&Arc<RwLock<AppState>>>, events: &[Event]) {
+    let Some(app_state) = app_state else {
+        return;
+    };
+    let mut state = app_state.write().await;
+    for event in events {
+        if let Some(source) = &event.source {
+            state.mark_delivered(&source.path, source.inode, source.end);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +165,6 @@ impl NetworkStats {
 
 #[async_trait]
 pub trait HttpClient: Send + Sync {
-    async fn post_bytes(&self, url: &str, body: Vec<u8>) -> std::result::Result<String, EsError>;
     async fn post_bytes_with_timeout(
         &self,
         url: &str,
@@ -200,13 +216,6 @@ impl ReqwestHttpClient {
 
 #[async_trait]
 impl HttpClient for ReqwestHttpClient {
-    async fn post_bytes(&self, url: &str, body: Vec<u8>) -> std::result::Result<String, EsError> {
-        let (response, _latency) = self
-            .post_bytes_with_timeout(url, body, Duration::from_secs(30))
-            .await?;
-        Ok(response)
-    }
-
     async fn post_bytes_with_timeout(
         &self,
         url: &str,
@@ -220,7 +229,7 @@ impl HttpClient for ReqwestHttpClient {
             .client
             .post(url)
             .body(body)
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/x-ndjson")
             .send();
 
         let response = match timeout(timeout_duration, request_future).await {
@@ -240,10 +249,9 @@ impl HttpClient for ReqwestHttpClient {
         match status.as_u16() {
             200..=299 => {
                 // Success - process response body
-                let response_body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Failed to read response body".to_string());
+                let response_body = response.text().await.map_err(|e| {
+                    EsError::RequestFailed(format!("Failed to read bulk response: {e}"))
+                })?;
 
                 let latency = start_time.elapsed();
                 Ok((response_body, latency))
@@ -352,7 +360,16 @@ impl EsWorkerPool {
             es_queue_receiver,
             dead_letter_queue,
             conf,
+            app_state: None,
         })
+    }
+
+    pub fn with_app_state(mut self, app_state: Arc<RwLock<AppState>>) -> Self {
+        for worker in &mut self.workers {
+            worker.app_state = Some(app_state.clone());
+        }
+        self.app_state = Some(app_state);
+        self
     }
 
     /// Start a background task that periodically retries events from DLQ
@@ -360,6 +377,7 @@ impl EsWorkerPool {
         dlq: Arc<DeadLetterQueue>,
         conf: Settings,
         shutdown_notify: Arc<Notify>,
+        app_state: Option<Arc<RwLock<AppState>>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             // Create HTTP client for retry
@@ -376,11 +394,6 @@ impl EsWorkerPool {
                 }
             };
 
-            let es_url = format!(
-                "{}:{}/{}/_bulk",
-                conf.elasticsearch.host, conf.elasticsearch.port, conf.elasticsearch.index_name
-            );
-
             let mut retry_interval = Duration::from_secs(30);
             let max_interval = Duration::from_secs(300); // 5 min max
             let batch_size = 100;
@@ -390,9 +403,14 @@ impl EsWorkerPool {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(retry_interval) => {
+                        if let Err(e) = dlq.flush_to_disk().await {
+                            warn!("DLQ retry: could not persist queue before retry: {e}");
+                        }
+                        let retry_guard = dlq.lock_retry().await;
                         // Take a batch from DLQ
                         let batch = dlq.take_batch(batch_size).await;
                         if batch.is_empty() {
+                            drop(retry_guard);
                             // Reset interval when queue is empty
                             retry_interval = Duration::from_secs(30);
                             continue;
@@ -407,7 +425,7 @@ impl EsWorkerPool {
                         // Build bulk request body
                         let mut body = Vec::new();
                         for event in &events {
-                            let index = Index::new();
+                            let index = Index::for_event(event);
                             let fields = FieldsBody::new(
                                 event.message.clone(),
                                 event.timestamp,
@@ -428,6 +446,7 @@ impl EsWorkerPool {
                         }
 
                         // Send to ES
+                        let es_url = build_es_url_from_conf(&conf);
                         match timeout(
                             Duration::from_secs(30),
                             client
@@ -437,9 +456,38 @@ impl EsWorkerPool {
                                 .send()
                         ).await {
                             Ok(Ok(response)) if response.status().is_success() => {
-                                info!("DLQ retry: successfully sent {} events", event_count);
-                                dlq.mark_recovered(event_count).await;
-                                retry_interval = Duration::from_secs(30); // Reset on success
+                                let outcome = response.text().await
+                                    .map_err(|e| EsError::RequestFailed(format!("Failed to read bulk response: {e}")))
+                                    .and_then(|body| failed_items(&body, event_count));
+                                match outcome {
+                                    Ok(failures) => {
+                                        let mut failure_reasons: HashMap<usize, String> = failures.into_iter().collect();
+                                        let mut to_retry = Vec::new();
+                                        let mut succeeded = Vec::new();
+                                        for (index, letter) in batch.into_iter().enumerate() {
+                                            if failure_reasons.remove(&index).is_some() {
+                                                to_retry.push(letter);
+                                            } else {
+                                                succeeded.push(letter.event);
+                                            }
+                                        }
+                                        acknowledge_events(app_state.as_ref(), &succeeded).await;
+                                        dlq.mark_recovered(succeeded.len()).await;
+                                        if to_retry.is_empty() {
+                                            info!("DLQ retry: recovered {} events", succeeded.len());
+                                            retry_interval = Duration::from_secs(30);
+                                        } else {
+                                            warn!("DLQ retry: {} of {} items failed", to_retry.len(), event_count);
+                                            dlq.return_failed(to_retry).await;
+                                            retry_interval = (retry_interval * 2).min(max_interval);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("DLQ retry: {e}");
+                                        dlq.return_failed(batch).await;
+                                        retry_interval = (retry_interval * 2).min(max_interval);
+                                    }
+                                }
                             }
                             Ok(Ok(response)) => {
                                 warn!("DLQ retry: ES returned error status {}", response.status());
@@ -456,6 +504,11 @@ impl EsWorkerPool {
                                 dlq.return_failed(batch).await;
                                 retry_interval = (retry_interval * 2).min(max_interval);
                             }
+                        }
+
+                        drop(retry_guard);
+                        if let Err(e) = dlq.flush_to_disk().await {
+                            warn!("DLQ retry: could not persist queue after retry: {e}");
                         }
                     }
                     _ = shutdown_notify.notified() => {
@@ -483,6 +536,7 @@ impl EsWorkerPool {
             Arc::clone(&self.dead_letter_queue),
             self.conf.clone(),
             shutdown_notify.clone(),
+            self.app_state.clone(),
         );
 
         info!("Starting ES worker pool with {} workers", worker_count);
@@ -610,6 +664,7 @@ impl EsWorker {
             circuit_breaker,
             dead_letter_queue,
             network_stats: NetworkStats::default(),
+            app_state: None,
         })
     }
 
@@ -639,6 +694,7 @@ impl EsWorker {
             circuit_breaker,
             dead_letter_queue,
             network_stats: NetworkStats::default(),
+            app_state: None,
         }
     }
 
@@ -734,17 +790,10 @@ impl EsWorker {
                             let timeout_duration = timeout;
 
                             async move {
-                                // Try with adaptive timeout first
-                                match http_client
-                                    .post_bytes_with_timeout(&url, body.clone(), timeout_duration)
+                                http_client
+                                    .post_bytes_with_timeout(&url, body, timeout_duration)
                                     .await
-                                {
-                                    Ok((response, latency)) => Ok((response, Some(latency))),
-                                    Err(_e) => {
-                                        // Fallback to regular method for compatibility
-                                        http_client.post_bytes(&url, body).await.map(|r| (r, None))
-                                    }
-                                }
+                                    .map(|(response, latency)| (response, Some(latency)))
                             }
                         })
                         .await
@@ -754,6 +803,31 @@ impl EsWorker {
 
         match result {
             Ok((response_body, latency_opt)) => {
+                let failures = match failed_items(&response_body, event_count) {
+                    Ok(failures) => failures,
+                    Err(e) => {
+                        self.network_stats.record_failure();
+                        for event in events_backup {
+                            self.dead_letter_queue
+                                .add_failed_event(event, e.to_string())
+                                .await;
+                        }
+                        return Err(e);
+                    }
+                };
+
+                let failure_count = failures.len();
+                let mut failure_reasons: HashMap<usize, String> = failures.into_iter().collect();
+                let mut succeeded = Vec::with_capacity(event_count - failure_count);
+                for (index, event) in events_backup.into_iter().enumerate() {
+                    if let Some(reason) = failure_reasons.remove(&index) {
+                        self.dead_letter_queue.add_failed_event(event, reason).await;
+                    } else {
+                        succeeded.push(event);
+                    }
+                }
+                acknowledge_events(self.app_state.as_ref(), &succeeded).await;
+
                 // Record network success and latency
                 let actual_latency = latency_opt.unwrap_or_else(|| start_time.elapsed());
                 self.network_stats.record_success(actual_latency);
@@ -769,7 +843,13 @@ impl EsWorker {
                         &response_body
                     }
                 );
-                Ok(())
+                if failure_count == 0 {
+                    Ok(())
+                } else {
+                    Err(EsError::RequestFailed(format!(
+                        "{failure_count} of {event_count} bulk items failed"
+                    )))
+                }
             }
             Err(CircuitBreakerError::CircuitOpen) => {
                 // Record network failure
@@ -823,7 +903,7 @@ impl EsWorker {
 
         for event in events {
             // Add index action
-            let index = Index::new();
+            let index = Index::for_event(&event);
             serde_json::to_writer(&mut body, &index)
                 .map_err(|e| EsError::SerializationFailed(format!("Index serialization: {}", e)))?;
             body.put_slice(b"\n");
@@ -873,8 +953,7 @@ pub(crate) fn planned_worker_count(conf: &Settings) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Tests would use Event and Meta when more comprehensive tests are added
-    use crate::domain::event::{Event, Meta};
+    use crate::domain::event::{Event, Meta, SourcePosition};
 
     #[test]
     fn test_planned_worker_count() {
@@ -895,23 +974,19 @@ mod tests {
     }
 
     struct NoopClient;
+    const SUCCESSFUL_BULK_RESPONSE: &str = r#"{"errors":false,"items":[{"index":{"status":201}}]}"#;
     #[async_trait]
     impl HttpClient for NoopClient {
-        async fn post_bytes(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-        ) -> std::result::Result<String, EsError> {
-            Ok("ok".to_string())
-        }
-
         async fn post_bytes_with_timeout(
             &self,
             _url: &str,
             _body: Vec<u8>,
             _timeout: Duration,
         ) -> std::result::Result<(String, Duration), EsError> {
-            Ok(("ok".to_string(), Duration::from_millis(50)))
+            Ok((
+                SUCCESSFUL_BULK_RESPONSE.to_string(),
+                Duration::from_millis(50),
+            ))
         }
     }
 
@@ -937,17 +1012,121 @@ mod tests {
         assert!(res.is_ok());
     }
 
-    struct FailingClient;
+    struct BulkResponseClient(&'static str);
+
     #[async_trait]
-    impl HttpClient for FailingClient {
-        async fn post_bytes(
+    impl HttpClient for BulkResponseClient {
+        async fn post_bytes_with_timeout(
             &self,
             _url: &str,
             _body: Vec<u8>,
-        ) -> std::result::Result<String, EsError> {
-            Err(EsError::RequestFailed("boom".to_string()))
+            _timeout: Duration,
+        ) -> std::result::Result<(String, Duration), EsError> {
+            Ok((self.0.to_string(), Duration::from_millis(1)))
         }
+    }
 
+    fn bulk_test_event(message: &str) -> Event {
+        Event::new(message.to_string(), Meta::default())
+    }
+
+    #[tokio::test]
+    async fn test_bulk_200_with_failed_item_goes_to_dlq() {
+        let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
+            persistence_file: None,
+            ..DeadLetterQueueConfig::default()
+        }));
+        let response = r#"{"errors":true,"items":[{"index":{"status":429,"error":{"type":"es_rejected_execution_exception"}}}]}"#;
+        let mut worker = EsWorker::new_with_client(
+            0,
+            create_test_config(),
+            dlq.clone(),
+            Arc::new(BulkResponseClient(response)),
+        );
+
+        assert!(
+            worker
+                .process_events(vec![bulk_test_event("rejected")])
+                .await
+                .is_err()
+        );
+        let failed = dlq.take_batch(10).await;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].event.message, "rejected");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_partial_success_queues_only_failed_item() {
+        let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
+            persistence_file: None,
+            ..DeadLetterQueueConfig::default()
+        }));
+        let response = r#"{"errors":true,"items":[{"index":{"status":201}},{"index":{"status":429,"error":{"type":"es_rejected_execution_exception"}}}]}"#;
+        let mut worker = EsWorker::new_with_client(
+            0,
+            create_test_config(),
+            dlq.clone(),
+            Arc::new(BulkResponseClient(response)),
+        );
+
+        let events = vec![bulk_test_event("accepted"), bulk_test_event("rejected")];
+        assert!(worker.process_events(events).await.is_err());
+        let failed = dlq.take_batch(10).await;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].event.message, "rejected");
+    }
+
+    #[tokio::test]
+    async fn test_bulk_partial_success_commits_only_acknowledged_prefix() {
+        let path = "/var/log/pods/test.log";
+        let mut state = AppState::new();
+        state.add_file(path.to_string(), 42, 20, 0);
+        state.update_file_position(path.to_string(), 20);
+        state.register_pending(path, 42, 10);
+        state.register_pending(path, 42, 20);
+        let app_state = Arc::new(RwLock::new(state));
+        let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
+            persistence_file: None,
+            ..DeadLetterQueueConfig::default()
+        }));
+        let response = r#"{"errors":true,"items":[{"index":{"status":201}},{"index":{"status":429,"error":{"type":"es_rejected_execution_exception"}}}]}"#;
+        let mut worker = EsWorker::new_with_client(
+            0,
+            create_test_config(),
+            dlq.clone(),
+            Arc::new(BulkResponseClient(response)),
+        );
+        worker.app_state = Some(app_state.clone());
+
+        let events = [10, 20]
+            .into_iter()
+            .map(|end| {
+                Event::from_file(
+                    format!("line {end}"),
+                    Meta::default(),
+                    SourcePosition {
+                        path: path.to_string(),
+                        inode: 42,
+                        end,
+                    },
+                )
+            })
+            .collect();
+        assert!(worker.process_events(events).await.is_err());
+        assert_eq!(
+            app_state
+                .read()
+                .await
+                .clone_for_save()
+                .get_file_position(path),
+            Some(10)
+        );
+        assert_eq!(dlq.take_batch(10).await.len(), 1);
+    }
+
+    struct FailingClient;
+    #[async_trait]
+    impl HttpClient for FailingClient {
         async fn post_bytes_with_timeout(
             &self,
             _url: &str,
@@ -1042,14 +1221,6 @@ mod tests {
     struct TimeoutClient;
     #[async_trait]
     impl HttpClient for TimeoutClient {
-        async fn post_bytes(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-        ) -> std::result::Result<String, EsError> {
-            Err(EsError::Timeout)
-        }
-
         async fn post_bytes_with_timeout(
             &self,
             _url: &str,
@@ -1063,16 +1234,6 @@ mod tests {
     struct DnsFailureClient;
     #[async_trait]
     impl HttpClient for DnsFailureClient {
-        async fn post_bytes(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-        ) -> std::result::Result<String, EsError> {
-            Err(EsError::DnsResolutionFailed(
-                "elasticsearch.example.com: dns lookup failed".to_string(),
-            ))
-        }
-
         async fn post_bytes_with_timeout(
             &self,
             _url: &str,
@@ -1088,16 +1249,6 @@ mod tests {
     struct RateLimitedClient;
     #[async_trait]
     impl HttpClient for RateLimitedClient {
-        async fn post_bytes(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-        ) -> std::result::Result<String, EsError> {
-            Err(EsError::RateLimited {
-                retry_after: Some(Duration::from_secs(10)),
-            })
-        }
-
         async fn post_bytes_with_timeout(
             &self,
             _url: &str,
@@ -1113,15 +1264,6 @@ mod tests {
     struct SlowClient;
     #[async_trait]
     impl HttpClient for SlowClient {
-        async fn post_bytes(
-            &self,
-            _url: &str,
-            _body: Vec<u8>,
-        ) -> std::result::Result<String, EsError> {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            Ok("slow response".to_string())
-        }
-
         async fn post_bytes_with_timeout(
             &self,
             _url: &str,
@@ -1129,7 +1271,10 @@ mod tests {
             _timeout: Duration,
         ) -> std::result::Result<(String, Duration), EsError> {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            Ok(("slow response".to_string(), Duration::from_millis(100)))
+            Ok((
+                SUCCESSFUL_BULK_RESPONSE.to_string(),
+                Duration::from_millis(100),
+            ))
         }
     }
 

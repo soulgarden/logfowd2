@@ -1,19 +1,18 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{Receiver, Sender, UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tracing::{debug, warn};
 
 use crate::infrastructure::metrics::metrics;
 
 /// NotifyBridge provides a two-tier channel architecture to prevent notify callback blocking.
-/// It uses an unbounded channel for the notify callback and bridges to a bounded channel
-/// with proper backpressure handling and metrics for filesystem events.
+/// A bounded callback queue protects memory; overflow requests a filesystem rescan.
 pub struct NotifyBridge {
-    /// Unbounded sender for notify callback - never blocks
-    notify_sender: UnboundedSender<notify::Result<notify::Event>>,
-    /// Unbounded receiver for bridge task
-    notify_receiver: Option<UnboundedReceiver<notify::Result<notify::Event>>>,
+    notify_sender: Sender<notify::Result<notify::Event>>,
+    notify_receiver: Option<Receiver<notify::Result<notify::Event>>>,
+    overflowed: Arc<AtomicBool>,
     /// Configuration parameters
     config: NotifyBridgeConfig,
     /// Metrics enabled flag
@@ -23,6 +22,7 @@ pub struct NotifyBridge {
 /// Configuration for NotifyBridge behavior
 #[derive(Clone, Debug)]
 pub struct NotifyBridgeConfig {
+    pub callback_channel_size: usize,
     /// Warning threshold for unbounded queue size
     pub notify_buffer_warning_threshold: usize,
     /// Interval for logging queue size warnings
@@ -34,6 +34,7 @@ pub struct NotifyBridgeConfig {
 impl Default for NotifyBridgeConfig {
     fn default() -> Self {
         Self {
+            callback_channel_size: 10_000,
             notify_buffer_warning_threshold: 1000,
             warning_log_interval: Duration::from_secs(30),
             bounded_channel_size: 1024,
@@ -44,20 +45,26 @@ impl Default for NotifyBridgeConfig {
 impl NotifyBridge {
     /// Create new NotifyBridge with configuration
     pub fn new(config: NotifyBridgeConfig, metrics_enabled: bool) -> Self {
-        let (notify_sender, notify_receiver) = unbounded_channel();
+        let (notify_sender, notify_receiver) = channel(config.callback_channel_size.max(1));
 
         Self {
             notify_sender,
             notify_receiver: Some(notify_receiver),
+            overflowed: Arc::new(AtomicBool::new(false)),
             config,
             metrics_enabled,
         }
+    }
+
+    pub fn take_overflow(&self) -> bool {
+        self.overflowed.swap(false, Ordering::AcqRel)
     }
 
     /// Get the notify sender for use in the notify callback - never blocks
     pub fn notify_sender(&self) -> NotifyFilesystemSender {
         NotifyFilesystemSender {
             sender: self.notify_sender.clone(),
+            overflowed: self.overflowed.clone(),
             config: self.config.clone(),
             metrics_enabled: self.metrics_enabled,
         }
@@ -102,7 +109,7 @@ impl NotifyBridge {
 
     /// Internal bridge task that forwards events with backpressure handling
     async fn bridge_task(
-        mut receiver: UnboundedReceiver<notify::Result<notify::Event>>,
+        mut receiver: Receiver<notify::Result<notify::Event>>,
         bounded_sender: Sender<notify::Result<notify::Event>>,
         config: NotifyBridgeConfig,
         metrics_enabled: bool,
@@ -110,7 +117,6 @@ impl NotifyBridge {
     ) {
         let mut last_warning = None;
         let mut events_forwarded = 0u64;
-        let mut events_dropped_in_bridge = 0u64;
 
         debug!(
             "NotifyBridge task started with bounded channel size: {}",
@@ -163,20 +169,11 @@ impl NotifyBridge {
                                             .inc_by(1000);
                                     }
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    // Bounded channel is full - drop the event and count it
-                                    events_dropped_in_bridge += 1;
-                                    if metrics_enabled {
-                                        metrics()
-                                            .notify_filesystem_events_dropped
-                                            .with_label_values(&["bridge_bounded_channel_full"])
-                                            .inc();
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                                    if bounded_sender.send(event).await.is_err() {
+                                        break;
                                     }
-
-                                    // Log occasionally to avoid spam
-                                    if events_dropped_in_bridge % 100 == 1 {
-                                        warn!("NotifyBridge dropping filesystem events due to full bounded channel. Dropped {} events so far.", events_dropped_in_bridge);
-                                    }
+                                    events_forwarded += 1;
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                     debug!("Bounded channel closed, stopping NotifyBridge");
@@ -214,8 +211,7 @@ impl NotifyBridge {
                         }
                     }
 
-                    debug!("NotifyBridge shutdown complete. Forwarded {} events, dropped {} events",
-                        events_forwarded, events_dropped_in_bridge);
+                    debug!("NotifyBridge shutdown complete. Forwarded {} events", events_forwarded);
                     break;
                 }
             }
@@ -230,31 +226,26 @@ impl NotifyBridge {
                     .with_label_values(&["notify_bridge", "forwarded"])
                     .inc_by(remaining);
             }
-            if events_dropped_in_bridge > 0 {
-                metrics()
-                    .notify_filesystem_events_dropped
-                    .with_label_values(&["bridge_bounded_channel_full"])
-                    .inc_by(events_dropped_in_bridge);
-            }
         }
     }
 }
 
 /// Sender wrapper for the notify callback that provides non-blocking filesystem event sending
 pub struct NotifyFilesystemSender {
-    sender: UnboundedSender<notify::Result<notify::Event>>,
+    sender: Sender<notify::Result<notify::Event>>,
+    overflowed: Arc<AtomicBool>,
     #[allow(dead_code)]
     config: NotifyBridgeConfig,
     metrics_enabled: bool,
 }
 
 impl NotifyFilesystemSender {
-    /// Send filesystem event - never blocks, uses unbounded channel
+    /// Never block the notify callback; a full queue is recovered by a rescan.
     pub fn send(
         &self,
         event: notify::Result<notify::Event>,
     ) -> Result<(), NotifyFilesystemSendError> {
-        match self.sender.send(event) {
+        match self.sender.try_send(event) {
             Ok(()) => {
                 // Update metrics
                 if self.metrics_enabled {
@@ -265,11 +256,21 @@ impl NotifyFilesystemSender {
                 }
                 Ok(())
             }
-            Err(_) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.overflowed.store(true, Ordering::Release);
                 if self.metrics_enabled {
                     metrics()
                         .notify_filesystem_events_dropped
-                        .with_label_values(&["unbounded_channel_closed"])
+                        .with_label_values(&["callback_queue_full"])
+                        .inc();
+                }
+                Err(NotifyFilesystemSendError::BufferFull)
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                if self.metrics_enabled {
+                    metrics()
+                        .notify_filesystem_events_dropped
+                        .with_label_values(&["channel_closed"])
                         .inc();
                 }
                 Err(NotifyFilesystemSendError::ChannelClosed)
@@ -277,12 +278,10 @@ impl NotifyFilesystemSender {
         }
     }
 
-    /// Get current queue size for monitoring - not available for unbounded channels
+    /// Get current callback queue size for monitoring.
     #[allow(dead_code)]
     pub fn queue_size(&self) -> usize {
-        // UnboundedSender doesn't provide len(), so we can't track actual queue size
-        // This is a limitation we accept for the benefit of never blocking the notify callback
-        0
+        self.sender.max_capacity() - self.sender.capacity()
     }
 }
 
@@ -290,6 +289,7 @@ impl Clone for NotifyFilesystemSender {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            overflowed: self.overflowed.clone(),
             config: self.config.clone(),
             metrics_enabled: self.metrics_enabled,
         }
@@ -298,12 +298,14 @@ impl Clone for NotifyFilesystemSender {
 
 #[derive(Debug)]
 pub enum NotifyFilesystemSendError {
+    BufferFull,
     ChannelClosed,
 }
 
 impl std::fmt::Display for NotifyFilesystemSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::BufferFull => write!(f, "Notify filesystem event queue is full"),
             Self::ChannelClosed => write!(f, "Notify filesystem event channel is closed"),
         }
     }
@@ -333,8 +335,7 @@ mod tests {
 
         assert!(notify_sender.send(test_event).is_ok());
 
-        // Queue size is not trackable with UnboundedSender
-        assert_eq!(notify_sender.queue_size(), 0);
+        assert_eq!(notify_sender.queue_size(), 1);
     }
 
     #[tokio::test]
@@ -355,8 +356,32 @@ mod tests {
             assert!(notify_sender.send(test_event).is_ok());
         }
 
-        // UnboundedSender should never block or return Full
-        // The backpressure handling happens downstream in the NotifyBridge task
+        // The callback queue remains bounded and non-blocking at this load.
+    }
+
+    #[test]
+    fn test_callback_overflow_requests_reconciliation() {
+        let config = NotifyBridgeConfig {
+            callback_channel_size: 1,
+            ..NotifyBridgeConfig::default()
+        };
+        let bridge = NotifyBridge::new(config, false);
+        let sender = bridge.notify_sender();
+        let event = || {
+            Ok(notify::Event {
+                kind: notify::EventKind::Create(notify::event::CreateKind::File),
+                paths: vec![std::path::PathBuf::from("/test/overflow.log")],
+                attrs: Default::default(),
+            })
+        };
+
+        sender.send(event()).unwrap();
+        assert!(matches!(
+            sender.send(event()),
+            Err(NotifyFilesystemSendError::BufferFull)
+        ));
+        assert!(bridge.take_overflow());
+        assert!(!bridge.take_overflow());
     }
 
     #[tokio::test]
@@ -397,6 +422,54 @@ mod tests {
 
         // Wait for bridge task to complete
         let _ = tokio::time::timeout(Duration::from_millis(100), bridge_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_full_bridge_channel_eventually_delivers_pending_notification() {
+        let config = NotifyBridgeConfig {
+            bounded_channel_size: 1,
+            ..NotifyBridgeConfig::default()
+        };
+        let (notify_sender, notify_receiver) = channel(2);
+        let (bounded_sender, mut bounded_receiver) = tokio::sync::mpsc::channel(1);
+        for name in ["first", "second"] {
+            notify_sender
+                .try_send(Ok(notify::Event {
+                    kind: notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                        notify::event::DataChange::Content,
+                    )),
+                    paths: vec![std::path::PathBuf::from(format!("/test/{name}.log"))],
+                    attrs: Default::default(),
+                }))
+                .unwrap();
+        }
+
+        let shutdown = Arc::new(Notify::new());
+        let handle = tokio::spawn(NotifyBridge::bridge_task(
+            notify_receiver,
+            bounded_sender,
+            config,
+            false,
+            shutdown.clone(),
+        ));
+        time::sleep(Duration::from_millis(20)).await;
+
+        let first = time::timeout(Duration::from_secs(1), bounded_receiver.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let second = time::timeout(Duration::from_millis(100), bounded_receiver.recv()).await;
+        shutdown.notify_waiters();
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(first.paths[0], std::path::Path::new("/test/first.log"));
+        let second = second
+            .expect("overflowed notification should be recovered")
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.paths[0], std::path::Path::new("/test/second.log"));
     }
 
     #[tokio::test]

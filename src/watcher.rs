@@ -45,6 +45,7 @@ pub struct Watcher {
     #[allow(dead_code)]
     task_pool: SmartTaskPool,
     read_existing_on_startup: bool,
+    initial_sync_completed: bool,
     read_chunk_size: usize,
     max_line_size: usize,
     event_bridge: EventBridge,
@@ -87,6 +88,11 @@ impl Watcher {
 
         // Create EventBridge configuration from conf
         let event_bridge_config = EventBridgeConfig {
+            buffer_size: conf
+                .channels
+                .as_ref()
+                .and_then(|c| c.notify_buffer_max_size)
+                .unwrap_or(10_000),
             notify_buffer_warning_threshold: conf
                 .channels
                 .as_ref()
@@ -100,6 +106,11 @@ impl Watcher {
 
         // Create NotifyBridge configuration from conf
         let notify_bridge_config = NotifyBridgeConfig {
+            callback_channel_size: conf
+                .channels
+                .as_ref()
+                .and_then(|c| c.notify_buffer_max_size)
+                .unwrap_or(10_000),
             notify_buffer_warning_threshold: conf
                 .channels
                 .as_ref()
@@ -125,6 +136,7 @@ impl Watcher {
             metrics_enabled,
             task_pool: SmartTaskPool::production_optimized(),
             read_existing_on_startup: read_existing,
+            initial_sync_completed: false,
             read_chunk_size,
             max_line_size,
             event_bridge,
@@ -132,6 +144,10 @@ impl Watcher {
             notify_bridge,
             notify_filesystem_sender,
         }
+    }
+
+    pub fn state_handle(&self) -> Arc<RwLock<AppState>> {
+        self.app_state.clone()
     }
 
     pub async fn run(&mut self, notify: Arc<Notify>) -> std::result::Result<(), notify::Error> {
@@ -153,8 +169,6 @@ impl Watcher {
         // Start NotifyBridge task
         let (notify_bridge_handle, filesystem_event_receiver) =
             self.notify_bridge.start_bridge_task(notify.clone());
-
-        self.sync_files(path).await;
 
         // Start periodic state saving task
         let state_clone = self.app_state.clone();
@@ -250,9 +264,20 @@ impl Watcher {
         )?;
 
         watcher.watch(path.as_ref(), RecursiveMode::Recursive)?;
+        self.sync_files(path).await;
+        self.initial_sync_completed = true;
+
+        let mut reconciliation = interval(Duration::from_secs(5));
+        reconciliation.tick().await;
 
         loop {
             tokio::select! {
+                _ = reconciliation.tick() => {
+                    if self.notify_bridge.take_overflow() {
+                        warn!("Filesystem notification queue overflowed; reconciling log files");
+                        self.sync_files(path).await;
+                    }
+                }
                 Some(event) = rx.recv() => {
                     match event {
                         Ok(event) => {
@@ -439,7 +464,10 @@ impl Watcher {
                                 _ => {}
                             }
                         }
-                        Err(e) => info!("watch error: {:?}", e),
+                        Err(e) => {
+                            warn!("watch error: {:?}; reconciling log files", e);
+                            self.sync_files(path).await;
+                        }
                     }
                 }
                 // Removed 100ms polling cycle - now purely event-driven for CPU efficiency
@@ -478,6 +506,30 @@ impl Watcher {
                         };
 
                         if self.regexp.is_match(&path_str) {
+                            if self.file_trackers.contains_key(&path_str) {
+                                loop {
+                                    let events = {
+                                        let mut state = self.app_state.write().await;
+                                        let tracker = self.file_trackers.get_mut(&path_str).unwrap();
+                                        match tracker
+                                            .read_new_lines_limited(&mut state, Some(self.read_chunk_size))
+                                            .await
+                                        {
+                                            Ok(events) => events,
+                                            Err(e) => {
+                                                warn!("Failed to reconcile {}: {}", path_str, e);
+                                                Vec::new()
+                                            }
+                                        }
+                                    };
+                                    if events.is_empty() {
+                                        break;
+                                    }
+                                    self.safe_send_events(events).await;
+                                }
+                                continue;
+                            }
+
                             // Create tracker with proper AppState registration during sync
                             let tracker = {
                                 let mut state = self.app_state.write().await;
@@ -494,7 +546,7 @@ impl Watcher {
                             };
 
                             if let Some(mut tracker) = tracker {
-                                if self.read_existing_on_startup {
+                                if self.read_existing_on_startup || self.initial_sync_completed {
                                     // Stream historical content in chunks with drop/reacquire pattern
                                     loop {
                                         let events = {
@@ -813,6 +865,17 @@ impl Watcher {
             }
         };
 
+        if let Some(tracker) = self.file_trackers.get_mut(&path_str) {
+            let mut state = self.app_state.write().await;
+            return tracker
+                .read_new_lines_limited(&mut state, Some(MAX_BATCH_SIZE))
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Failed to read existing tracker {}: {}", path_str, e);
+                    Vec::new()
+                });
+        }
+
         // Acquire lock once and hold it for the entire operation
         let mut state = self.app_state.write().await;
 
@@ -834,7 +897,7 @@ impl Watcher {
         // Collect all events atomically
         let mut collected_events: Vec<Event> = Vec::new();
 
-        if self.read_existing_on_startup {
+        if self.read_existing_on_startup || self.initial_sync_completed {
             // Read all content in chunks, collecting events under single lock
             loop {
                 // Check MAX_BATCH_SIZE limit
@@ -968,7 +1031,7 @@ impl Watcher {
 
     #[allow(dead_code)]
     async fn safe_send_event(&mut self, event: Event) {
-        match self.notify_sender.try_send(event) {
+        match self.notify_sender.send(event).await {
             Ok(()) => {}
             Err(crate::transport::bridge::NotifyEventSendError::ChannelClosed) => {
                 warn!("Notify event channel closed, unable to send event");
@@ -980,7 +1043,7 @@ impl Watcher {
         let mut successful_sends = 0u64;
 
         for event in events {
-            match self.notify_sender.try_send(event) {
+            match self.notify_sender.send(event).await {
                 Ok(()) => {
                     successful_sends += 1;
                 }
@@ -1226,9 +1289,7 @@ mod tests {
         // Send event via notify sender (which goes to EventBridge)
         watcher.safe_send_event(test_event.clone()).await;
 
-        // Event should be sent to the EventBridge's unbounded channel
-        // UnboundedSender doesn't track queue size, so this will always be 0
-        assert_eq!(watcher.notify_sender.queue_size(), 0);
+        assert_eq!(watcher.notify_sender.queue_size(), 1);
     }
 
     #[tokio::test]
@@ -1248,9 +1309,7 @@ mod tests {
         // Send multiple events via notify sender (which goes to EventBridge)
         watcher.safe_send_events(events).await;
 
-        // All events should be sent to the EventBridge's unbounded channel
-        // UnboundedSender doesn't track queue size, so this will always be 0
-        assert_eq!(watcher.notify_sender.queue_size(), 0);
+        assert_eq!(watcher.notify_sender.queue_size(), 3);
     }
 
     #[tokio::test]
@@ -1611,6 +1670,57 @@ mod tests {
             watcher.file_trackers.is_empty(),
             "Should not create trackers for nonexistent directory"
         );
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_reads_file_after_missed_modify_event() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("pods");
+        let log_dir = root.join("ns_pod_pod-id/container");
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_file = log_dir.join("0.log");
+        fs::write(&log_file, "history\n").unwrap();
+
+        let channel = create_bounded_channel(8, None, None, None, None);
+        let receiver = channel.receiver();
+        let mut conf = create_test_conf();
+        conf.log_path = root.to_string_lossy().to_string();
+        conf.state_file_path = Some(dir.path().join("state.json").to_string_lossy().to_string());
+        conf.read_existing_on_startup = Some(false);
+        let mut watcher = Watcher::new(conf, channel.sender());
+        watcher.regexp = Regex::new(&K8S_PODS_REGEXP.replacen(
+            "/var/log/pods",
+            &regex::escape(root.to_str().unwrap()),
+            1,
+        ))
+        .unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let bridge = watcher
+            .event_bridge
+            .start_bridge_task(watcher.process_queue_sender.clone(), shutdown.clone());
+
+        watcher.sync_files(&root).await;
+        watcher.initial_sync_completed = true;
+        fs::write(&log_file, "history\nmissed notification\n").unwrap();
+        watcher.sync_files(&root).await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.message, "missed notification");
+
+        let new_log = log_dir.join("1.log");
+        fs::write(&new_log, "created after startup\n").unwrap();
+        watcher.sync_files(&root).await;
+        let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.message, "created after startup");
+        shutdown.notify_waiters();
+        bridge.abort();
+        let _ = bridge.await;
     }
 
     #[tokio::test]

@@ -1,6 +1,10 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+#[cfg(test)]
 use uuid::Uuid;
+
+use crate::domain::event::Event;
 
 #[derive(Serialize)]
 pub struct Index {
@@ -8,9 +12,31 @@ pub struct Index {
 }
 
 impl Index {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             index: IndexBody::new(),
+        }
+    }
+
+    pub fn for_event(event: &Event) -> Self {
+        let mut hasher = Sha256::new();
+        if let Some(source) = &event.source {
+            hasher.update(source.path.as_bytes());
+            hasher.update(source.inode.to_be_bytes());
+            hasher.update(source.end.to_be_bytes());
+            hasher.update(event.message.as_bytes());
+        } else {
+            hasher.update(serde_json::to_vec(event).expect("Event serialization cannot fail"));
+        }
+        let digest = hasher.finalize();
+        let mut id = String::with_capacity(digest.len() * 2);
+        use std::fmt::Write;
+        for byte in digest {
+            write!(&mut id, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        Self {
+            index: IndexBody { id },
         }
     }
 }
@@ -22,6 +48,7 @@ pub struct IndexBody {
 }
 
 impl IndexBody {
+    #[cfg(test)]
     pub fn new() -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
@@ -63,6 +90,7 @@ impl FieldsBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::event::{Meta, SourcePosition};
     use chrono::{TimeZone, Utc};
 
     #[test]
@@ -99,6 +127,23 @@ mod tests {
 
         // IDs should be unique
         assert_ne!(body1.id, body2.id);
+    }
+
+    #[test]
+    fn test_file_event_id_is_stable_across_replay() {
+        let source = SourcePosition {
+            path: "/var/log/pods/ns_pod_id/container/0.log".to_string(),
+            inode: 42,
+            end: 128,
+        };
+        let first = Event::from_file("line".to_string(), Meta::default(), source.clone());
+        let replay = Event::from_file("line".to_string(), Meta::default(), source);
+
+        assert_eq!(
+            Index::for_event(&first).index.id,
+            Index::for_event(&replay).index.id
+        );
+        assert_ne!(Index::for_event(&first).index.id, Index::new().index.id);
     }
 
     #[test]
