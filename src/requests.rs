@@ -90,6 +90,30 @@ impl FieldsBody {
     }
 }
 
+#[derive(Serialize)]
+pub struct FieldsBodyRef<'a> {
+    message: &'a str,
+    #[serde(rename(serialize = "@timestamp"))]
+    timestamp: &'a DateTime<Utc>,
+    pod_name: &'a str,
+    namespace: &'a str,
+    container_name: &'a str,
+    pod_id: &'a str,
+}
+
+impl<'a> FieldsBodyRef<'a> {
+    pub fn for_event(event: &'a Event) -> Self {
+        Self {
+            message: &event.message,
+            timestamp: &event.timestamp,
+            pod_name: &event.meta.pod_name,
+            namespace: &event.meta.namespace,
+            container_name: &event.meta.container_name,
+            pod_id: &event.meta.pod_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +128,38 @@ mod tests {
         let json = serde_json::to_string(&index).unwrap();
         assert!(json.contains("index"));
         assert!(json.contains("_id"));
+    }
+
+    #[test]
+    fn test_borrowed_fields_match_owned_bulk_document() {
+        let event = Event::from_file(
+            "message with \"quotes\" and unicode: caf\u{e9}".to_string(),
+            Meta {
+                pod_name: "pod".to_string(),
+                namespace: "namespace".to_string(),
+                container_name: "container".to_string(),
+                pod_id: "pod-id".to_string(),
+            },
+            SourcePosition {
+                path: "/var/log/pods/namespace_pod-id/container/0.log".to_string(),
+                inode: 42,
+                end: 128,
+                generation: 1,
+            },
+        );
+        let owned = FieldsBody::new(
+            event.message.clone(),
+            event.timestamp,
+            event.meta.pod_name.clone(),
+            event.meta.namespace.clone(),
+            event.meta.container_name.clone(),
+            event.meta.pod_id.clone(),
+        );
+
+        assert_eq!(
+            serde_json::to_vec(&FieldsBodyRef::for_event(&event)).unwrap(),
+            serde_json::to_vec(&owned).unwrap()
+        );
     }
 
     #[test]
