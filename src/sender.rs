@@ -9,7 +9,7 @@ use tokio::time::interval;
 
 use crate::config::Settings;
 use crate::domain::event::Event;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::infrastructure::metrics::{are_metrics_enabled, metrics};
 use crate::traits::EventProcessor;
 use crate::transport::channels::{BoundedReceiver, BoundedSender};
@@ -70,7 +70,7 @@ impl Sender {
                             if !batch.is_empty() {
                                 self.send_batch(&mut batch).await;
                             }
-                            return Ok(());
+                            return Self::finish_result(&batch);
                         }
                         Err(_) => {
                             // Timeout - just continue with the loop to check other branches
@@ -82,24 +82,32 @@ impl Sender {
                 // Shutdown
                 _ = shutdown.notified() => {
                     info!("Sender received shutdown signal");
-
-                    if !batch.is_empty() {
-                        info!("Sending {} remaining events before shutdown", batch.len());
-                        // Use send_batch directly - it has built-in retry with backoff
-                        // (50 attempts × 100ms = 5 seconds max wait)
-                        // This ensures events are not lost during graceful shutdown
-                        self.send_batch(&mut batch).await;
-
-                        if batch.is_empty() {
-                            info!("Finished sending remaining events");
-                        } else {
-                            warn!("Could not deliver {} events during shutdown (ES unavailable)", batch.len());
+                    self.process_queue_receiver.close();
+                    while let Ok(event) = self.process_queue_receiver.recv().await {
+                        batch.push(event);
+                        if self.conf.elasticsearch.bulk_size > 0
+                            && batch.len() >= self.conf.elasticsearch.bulk_size
+                        {
+                            self.send_batch(&mut batch).await;
                         }
                     }
-
-                    return Ok(());
+                    if !batch.is_empty() {
+                        info!("Sending {} remaining events before shutdown", batch.len());
+                        self.send_batch(&mut batch).await;
+                    }
+                    return Self::finish_result(&batch);
                 }
             }
+        }
+    }
+
+    fn finish_result(batch: &[Event]) -> Result<()> {
+        if batch.is_empty() {
+            Ok(())
+        } else {
+            Err(AppError::ComponentStartup {
+                component: format!("Sender could not forward {} events", batch.len()),
+            })
         }
     }
 

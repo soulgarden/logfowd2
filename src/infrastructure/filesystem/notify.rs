@@ -23,7 +23,7 @@ pub struct NotifyBridge {
 #[derive(Clone, Debug)]
 pub struct NotifyBridgeConfig {
     pub callback_channel_size: usize,
-    /// Warning threshold for unbounded queue size
+    /// Warning threshold for queued notifications
     pub notify_buffer_warning_threshold: usize,
     /// Interval for logging queue size warnings
     pub warning_log_interval: Duration,
@@ -70,7 +70,7 @@ impl NotifyBridge {
         }
     }
 
-    /// Start the bridge task that forwards events from unbounded to bounded channel
+    /// Start the bridge task that forwards notifications to the watcher
     /// Returns both the bridge task handle and the bounded receiver for the watcher
     pub fn start_bridge_task(
         &mut self,
@@ -192,23 +192,12 @@ impl NotifyBridge {
                 _ = shutdown_notify.notified() => {
                     debug!("NotifyBridge received shutdown signal");
 
-                    // Process remaining events with timeout
-                    let timeout = Duration::from_secs(5);
-                    let deadline = Instant::now() + timeout;
-
-                    while let Ok(event) = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(deadline),
-                        receiver.recv()
-                    ).await {
-                        match event {
-                            Some(event) => {
-                                if bounded_sender.send(event).await.is_err() {
-                                    break;
-                                }
-                                events_forwarded += 1;
-                            }
-                            None => break,
+                    receiver.close();
+                    while let Some(event) = receiver.recv().await {
+                        if bounded_sender.send(event).await.is_err() {
+                            break;
                         }
+                        events_forwarded += 1;
                     }
 
                     debug!("NotifyBridge shutdown complete. Forwarded {} events", events_forwarded);

@@ -23,7 +23,7 @@ pub struct EventBridge {
 #[derive(Clone, Debug)]
 pub struct EventBridgeConfig {
     pub buffer_size: usize,
-    /// Warning threshold for unbounded queue size
+    /// Warning threshold for queued events
     pub notify_buffer_warning_threshold: usize,
     /// Interval for logging queue size warnings
     pub warning_log_interval: Duration,
@@ -61,7 +61,7 @@ impl EventBridge {
         }
     }
 
-    /// Start the bridge task that forwards events from unbounded to bounded channel
+    /// Start the bridge task that forwards events to the downstream channel
     pub fn start_bridge_task(
         &mut self,
         bounded_sender: BoundedSender<Event>,
@@ -169,24 +169,12 @@ impl EventBridge {
                 // Shutdown signal
                 _ = shutdown_notify.notified() => {
                     debug!("EventBridge received shutdown signal");
-
-                    // Process remaining events with timeout
-                    let timeout = Duration::from_secs(5);
-                    let deadline = Instant::now() + timeout;
-
-                    while let Ok(event) = tokio::time::timeout_at(
-                        tokio::time::Instant::from_std(deadline),
-                        receiver.recv()
-                    ).await {
-                        match event {
-                            Some(event) => {
-                                if bounded_sender.send(event).await.is_err() {
-                                    break;
-                                }
-                                events_forwarded += 1;
-                            }
-                            None => break,
+                    receiver.close();
+                    while let Some(event) = receiver.recv().await {
+                        if bounded_sender.send(event).await.is_err() {
+                            break;
                         }
+                        events_forwarded += 1;
                     }
 
                     debug!("EventBridge shutdown complete. Forwarded {} events, dropped {} events",

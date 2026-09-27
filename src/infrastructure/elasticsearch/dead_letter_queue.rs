@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, MutexGuard, Notify, RwLock};
+use tokio::sync::{Mutex, MutexGuard, RwLock, watch};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
@@ -259,7 +259,10 @@ impl DeadLetterQueue {
         Ok(())
     }
 
-    pub async fn start_background_tasks(&self, shutdown_notify: Arc<Notify>) -> JoinHandle<()> {
+    pub async fn start_background_tasks(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
         let queue_clone = Arc::clone(&self.queue);
         let config_clone = self.config.clone();
         let stats_clone = Arc::clone(&self.stats); // Share the same stats instance for consistency
@@ -296,7 +299,7 @@ impl DeadLetterQueue {
                             }
                         }
                     }
-                    _ = shutdown_notify.notified() => {
+                    _ = shutdown.changed() => {
                         info!("DLQ background flusher received shutdown signal");
 
                         // Perform final flush before shutdown
@@ -342,7 +345,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::NamedTempFile;
-    use tokio::sync::Notify;
 
     fn create_test_event(message: &str) -> Event {
         Event::new(message.to_string(), Meta::default())
@@ -983,7 +985,7 @@ mod tests {
         config.flush_interval = Duration::from_millis(100); // Fast flush for testing
 
         let dlq = DeadLetterQueue::new(config);
-        let shutdown_notify = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Add an event
         let event = create_test_event("shutdown test");
@@ -991,13 +993,13 @@ mod tests {
             .await;
 
         // Start background tasks
-        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+        let handle = dlq.start_background_tasks(shutdown_rx).await;
 
         // Give it time to start
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Signal shutdown
-        shutdown_notify.notify_waiters();
+        shutdown_tx.send(true).unwrap();
 
         // Wait for graceful shutdown
         let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
@@ -1020,10 +1022,10 @@ mod tests {
         config.flush_interval = Duration::from_millis(50); // Very fast for testing
 
         let dlq = DeadLetterQueue::new(config);
-        let shutdown_notify = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Start background tasks
-        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+        let handle = dlq.start_background_tasks(shutdown_rx).await;
 
         // Add events over time
         for i in 0..3 {
@@ -1040,7 +1042,7 @@ mod tests {
         }
 
         // Clean shutdown
-        shutdown_notify.notify_waiters();
+        shutdown_tx.send(true).unwrap();
         let result = tokio::time::timeout(Duration::from_millis(200), handle).await;
         assert!(result.is_ok());
     }
@@ -1051,7 +1053,7 @@ mod tests {
         let invalid_path = "/invalid/directory/does/not/exist/dead_letters.json";
         let config = create_test_config_with_file(invalid_path.to_string());
         let dlq = DeadLetterQueue::new(config);
-        let shutdown_notify = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Add an event
         let event = create_test_event("error test");
@@ -1059,12 +1061,12 @@ mod tests {
             .await;
 
         // Start background tasks
-        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+        let handle = dlq.start_background_tasks(shutdown_rx).await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Signal shutdown (final flush will fail due to invalid path)
-        shutdown_notify.notify_waiters();
+        shutdown_tx.send(true).unwrap();
 
         // Should still shut down gracefully despite flush error
         let result = tokio::time::timeout(Duration::from_millis(500), handle).await;
@@ -1082,17 +1084,17 @@ mod tests {
         config.flush_interval = Duration::from_millis(200);
 
         let dlq = DeadLetterQueue::new(config);
-        let shutdown_notify = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Start background tasks
-        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
+        let handle = dlq.start_background_tasks(shutdown_rx).await;
 
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         // Send multiple shutdown signals
-        shutdown_notify.notify_waiters();
-        shutdown_notify.notify_waiters();
-        shutdown_notify.notify_waiters();
+        let _ = shutdown_tx.send(true);
+        let _ = shutdown_tx.send(true);
+        let _ = shutdown_tx.send(true);
 
         // Should only handle the first one and exit cleanly
         let result = tokio::time::timeout(Duration::from_millis(300), handle).await;
@@ -1377,21 +1379,17 @@ mod tests {
         config.flush_interval = Duration::from_secs(60); // Long interval
 
         let dlq = DeadLetterQueue::new(config);
-        let shutdown_notify = Arc::new(Notify::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Add an event
         let event = create_test_event("immediate shutdown test");
         dlq.add_failed_event(event, "immediate shutdown failure".to_string())
             .await;
 
-        // Start background tasks and give it a moment to initialize
-        let handle = dlq.start_background_tasks(shutdown_notify.clone()).await;
-
-        // Small delay to ensure the background task is ready
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        let handle = dlq.start_background_tasks(shutdown_rx).await;
 
         // Signal shutdown immediately
-        shutdown_notify.notify_waiters();
+        shutdown_tx.send(true).unwrap();
 
         // Should complete final flush and shutdown
         let result = tokio::time::timeout(Duration::from_millis(500), handle).await;

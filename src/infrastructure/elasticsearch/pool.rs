@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::BufMut;
 use chrono::Utc;
 use reqwest::Client;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -51,7 +51,7 @@ async fn acknowledge_events(app_state: Option<&Arc<RwLock<AppState>>>, events: &
     let mut state = app_state.write().await;
     for event in events {
         if let Some(source) = &event.source {
-            state.mark_delivered(&source.path, source.inode, source.end);
+            state.mark_source_delivered(source);
         }
     }
 }
@@ -376,7 +376,7 @@ impl EsWorkerPool {
     fn start_dlq_retry_task(
         dlq: Arc<DeadLetterQueue>,
         conf: Settings,
-        shutdown_notify: Arc<Notify>,
+        mut shutdown: watch::Receiver<bool>,
         app_state: Option<Arc<RwLock<AppState>>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
@@ -511,7 +511,7 @@ impl EsWorkerPool {
                             warn!("DLQ retry: could not persist queue after retry: {e}");
                         }
                     }
-                    _ = shutdown_notify.notified() => {
+                    _ = shutdown.changed() => {
                         info!("DLQ retry task received shutdown signal");
                         break;
                     }
@@ -524,18 +524,19 @@ impl EsWorkerPool {
 
     pub async fn run(&mut self, shutdown_notify: Arc<Notify>) -> Result<()> {
         let worker_count = self.workers.len(); // Capture worker count before draining
+        let (background_stop, background_shutdown) = watch::channel(false);
 
         // Start DLQ background tasks with shutdown coordination
-        let _dlq_flush_handle = self
+        let dlq_flush_handle = self
             .dead_letter_queue
-            .start_background_tasks(shutdown_notify.clone())
+            .start_background_tasks(background_shutdown.clone())
             .await;
 
         // Start DLQ retry task
-        let _dlq_retry_handle = Self::start_dlq_retry_task(
+        let dlq_retry_handle = Self::start_dlq_retry_task(
             Arc::clone(&self.dead_letter_queue),
             self.conf.clone(),
-            shutdown_notify.clone(),
+            background_shutdown,
             self.app_state.clone(),
         );
 
@@ -551,11 +552,7 @@ impl EsWorkerPool {
 
         for mut worker in self.workers.drain(..) {
             let work_receiver_clone = work_receiver.clone();
-            let shutdown_notify_clone = shutdown_notify.clone();
-
-            let handle = tokio::spawn(async move {
-                worker.run(work_receiver_clone, shutdown_notify_clone).await
-            });
+            let handle = tokio::spawn(async move { worker.run(work_receiver_clone).await });
 
             worker_handles.push(handle);
         }
@@ -564,8 +561,6 @@ impl EsWorkerPool {
         let distribution_handle = {
             let work_sender = work_sender.clone();
             let es_queue_receiver = self.es_queue_receiver.clone();
-            let shutdown_notify_clone = shutdown_notify.clone();
-
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -600,29 +595,41 @@ impl EsWorkerPool {
                                 }
                             }
                         }
-                        _ = shutdown_notify_clone.notified() => {
-                            info!("ES worker pool distributor received shutdown signal");
-                            break;
-                        }
                     }
                 }
             })
         };
 
-        // Wait for shutdown
-        shutdown_notify.notified().await;
-        info!("ES worker pool shutting down...");
-
-        // Wait for distribution to finish
-        if let Err(e) = distribution_handle.await {
+        let mut distribution_handle = distribution_handle;
+        let distribution_result = tokio::select! {
+            result = &mut distribution_handle => result,
+            _ = shutdown_notify.notified() => {
+                self.es_queue_receiver.close();
+                distribution_handle.await
+            }
+        };
+        if let Err(e) = distribution_result {
             error!("Distribution handle error: {}", e);
         }
+        drop(work_sender);
 
-        // Wait for all workers to finish
         for handle in worker_handles {
-            if let Err(e) = handle.await {
-                error!("Worker handle error: {}", e);
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Worker error: {}", e),
+                Err(e) => error!("Worker handle error: {}", e),
             }
+        }
+
+        let _ = background_stop.send(true);
+        if let Err(e) = dlq_retry_handle.await {
+            error!("DLQ retry handle error: {}", e);
+        }
+        if let Err(e) = dlq_flush_handle.await {
+            error!("DLQ flush handle error: {}", e);
+        }
+        if let Err(e) = self.dead_letter_queue.flush_to_disk().await {
+            error!("Final DLQ flush failed: {}", e);
         }
 
         info!("ES worker pool shutdown complete");
@@ -698,33 +705,12 @@ impl EsWorker {
         }
     }
 
-    async fn run(
-        &mut self,
-        work_receiver: async_channel::Receiver<Vec<Event>>,
-        shutdown_notify: Arc<Notify>,
-    ) -> Result<()> {
+    async fn run(&mut self, work_receiver: async_channel::Receiver<Vec<Event>>) -> Result<()> {
         info!("ES Worker {} starting", self.id);
 
-        loop {
-            tokio::select! {
-                events_result = work_receiver.recv() => {
-                    match events_result {
-                        Ok(events) => {
-                            if let Err(e) = self.process_events(events).await {
-                                error!("Worker {} failed to process events: {}", self.id, e);
-                                // Continue processing other events instead of failing completely
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Worker {} receiver error: {}", self.id, e);
-                            break;
-                        }
-                    }
-                }
-                _ = shutdown_notify.notified() => {
-                    info!("ES Worker {} received shutdown signal", self.id);
-                    break;
-                }
+        while let Ok(events) = work_receiver.recv().await {
+            if let Err(e) = self.process_events(events).await {
+                error!("Worker {} failed to process events: {}", self.id, e);
             }
         }
 
@@ -1012,6 +998,132 @@ mod tests {
         assert!(res.is_ok());
     }
 
+    struct CountingClient(Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl HttpClient for CountingClient {
+        async fn post_bytes_with_timeout(
+            &self,
+            _url: &str,
+            body: Vec<u8>,
+            _timeout: Duration,
+        ) -> std::result::Result<(String, Duration), EsError> {
+            let count = body.iter().filter(|byte| **byte == b'\n').count() / 2;
+            self.0.fetch_add(count, std::sync::atomic::Ordering::SeqCst);
+            let items: Vec<_> = (0..count)
+                .map(|_| serde_json::json!({"index": {"status": 201}}))
+                .collect();
+            Ok((
+                serde_json::json!({"errors": false, "items": items}).to_string(),
+                Duration::from_millis(1),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_drains_queued_batches_after_input_closes() {
+        use crate::transport::channels::create_bounded_channel;
+        let channel = create_bounded_channel(4, None, None, None, None);
+        let mut sender = channel.sender();
+        let receiver = channel.receiver();
+        drop(channel);
+        let conf = create_test_config();
+        let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
+            persistence_file: None,
+            ..DeadLetterQueueConfig::default()
+        }));
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = EsWorker::new_with_client(
+            0,
+            conf.clone(),
+            dlq.clone(),
+            Arc::new(CountingClient(delivered.clone())),
+        );
+        let mut pool = EsWorkerPool {
+            workers: vec![worker],
+            es_queue_receiver: receiver,
+            dead_letter_queue: dlq,
+            conf,
+            app_state: None,
+        };
+
+        for n in 0..3 {
+            sender
+                .send(vec![bulk_test_event(&format!("batch {n}"))])
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), pool.run(Arc::new(Notify::new())))
+                .await
+                .expect("pool must exit after draining a closed input");
+        assert!(result.is_ok());
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_sender_and_pool_drain_every_event_on_shutdown() {
+        use crate::sender::Sender;
+        use crate::transport::channels::create_bounded_channel;
+
+        let watcher_channel = create_bounded_channel(16, None, None, None, None);
+        let mut input = watcher_channel.sender();
+        let sender_input = watcher_channel.receiver();
+        drop(watcher_channel);
+        let es_channel = create_bounded_channel(2, None, None, None, None);
+        let sender_output = es_channel.sender();
+        let pool_input = es_channel.receiver();
+        drop(es_channel);
+
+        let mut conf = create_test_config();
+        conf.elasticsearch.bulk_size = 3;
+        let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
+            persistence_file: None,
+            ..DeadLetterQueueConfig::default()
+        }));
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = EsWorker::new_with_client(
+            0,
+            conf.clone(),
+            dlq.clone(),
+            Arc::new(CountingClient(delivered.clone())),
+        );
+        let mut pool = EsWorkerPool {
+            workers: vec![worker],
+            es_queue_receiver: pool_input,
+            dead_letter_queue: dlq,
+            conf: conf.clone(),
+            app_state: None,
+        };
+        let mut sender = Sender::new(conf, sender_input, sender_output);
+        let sender_task = tokio::spawn(async move { sender.run(Arc::new(Notify::new())).await });
+        let pool_task = tokio::spawn(async move { pool.run(Arc::new(Notify::new())).await });
+
+        for n in 0..7 {
+            input
+                .send(bulk_test_event(&format!("event {n}")))
+                .await
+                .unwrap();
+        }
+        drop(input);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), sender_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), pool_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+        assert_eq!(delivered.load(std::sync::atomic::Ordering::SeqCst), 7);
+    }
+
     struct BulkResponseClient(&'static str);
 
     #[async_trait]
@@ -1084,6 +1196,7 @@ mod tests {
         state.update_file_position(path.to_string(), 20);
         state.register_pending(path, 42, 10);
         state.register_pending(path, 42, 20);
+        let generation = state.file_generation(path).unwrap();
         let app_state = Arc::new(RwLock::new(state));
         let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
             persistence_file: None,
@@ -1108,6 +1221,7 @@ mod tests {
                         path: path.to_string(),
                         inode: 42,
                         end,
+                        generation,
                     },
                 )
             })
