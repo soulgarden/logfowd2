@@ -15,6 +15,12 @@ pub struct SourcePosition {
     pub path: String,
     pub inode: u64,
     pub end: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub generation: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]

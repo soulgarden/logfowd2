@@ -18,7 +18,7 @@ pub fn listen_signals() -> Result<Arc<Notify>> {
         tokio::spawn(async move {
             sig.recv().await;
 
-            notify.notify_waiters();
+            notify.notify_one();
 
             info!("shutdown signal received");
         });

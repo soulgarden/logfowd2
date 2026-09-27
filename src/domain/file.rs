@@ -166,6 +166,9 @@ impl FileTracker {
         let mut events = Vec::new();
         let initial_position = self.position;
 
+        if self.file.is_some() {
+            self.ensure_file_in_state(app_state);
+        }
         if let Some(ref mut file) = self.file {
             let mut reader = BufReader::with_capacity(self.buffer_size, &mut *file);
             let mut line = String::new();
@@ -210,6 +213,7 @@ impl FileTracker {
                             path: self.path.clone(),
                             inode: self.inode,
                             end: self.position,
+                            generation: app_state.file_generation(&self.path).unwrap_or(0),
                         },
                     ));
                 }
@@ -248,7 +252,7 @@ impl FileTracker {
             let new_pos = file.seek(SeekFrom::End(0)).await?;
             self.position = new_pos;
             self.ensure_file_in_state(app_state);
-            app_state.update_file_position(self.path.clone(), self.position);
+            app_state.skip_to_position(&self.path, self.inode, self.position);
             debug!(
                 "Skipped existing content for {} to pos {}",
                 self.path, self.position
@@ -1735,6 +1739,10 @@ mod tests {
 
         // Skip to end and verify no events are read afterwards
         tracker.skip_existing_content(&mut state).await.unwrap();
+        assert_eq!(
+            state.clone_for_save().get_file_position(&path),
+            Some(fs::metadata(&path).unwrap().len())
+        );
         let events = tracker.read_new_lines(&mut state).await.unwrap();
         assert!(
             events.is_empty(),

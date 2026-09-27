@@ -246,6 +246,10 @@ impl<T> BoundedReceiver<T> {
             Err(_) => Err(RecvError::Closed),
         }
     }
+
+    pub fn close(&self) {
+        self.receiver.close();
+    }
 }
 
 impl<T> Clone for BoundedReceiver<T> {

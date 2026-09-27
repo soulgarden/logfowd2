@@ -58,6 +58,22 @@ fn init_tracing(config: &Settings) {
     }
 }
 
+fn record_task_result(
+    first_error: &mut Option<AppError>,
+    component: &str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) {
+    let error = match result {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error,
+        Err(error) => AppError::from(error),
+    };
+    error!("{} failed: {}", component, error);
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let conf = Settings::load().map_err(|err| {
@@ -80,12 +96,11 @@ async fn main() -> Result<()> {
         info!("Metrics system disabled in configuration");
     }
 
-    let shutdown_notify: Arc<tokio::sync::Notify> = listen_signals()?;
-
-    let watcher_shutdown_notify = shutdown_notify.clone();
-    let sender_shutdown_notify = shutdown_notify.clone();
-    let es_shutdown_notify = shutdown_notify.clone();
-    let metrics_shutdown_notify = shutdown_notify.clone();
+    let shutdown_signal = listen_signals()?;
+    let watcher_shutdown = Arc::new(tokio::sync::Notify::new());
+    let sender_shutdown = Arc::new(tokio::sync::Notify::new());
+    let pool_shutdown = Arc::new(tokio::sync::Notify::new());
+    let metrics_shutdown = Arc::new(tokio::sync::Notify::new());
 
     // Create bounded channels with backpressure
     let channel_config = conf.channels.as_ref();
@@ -119,79 +134,114 @@ async fn main() -> Result<()> {
 
     let mut watcher = Watcher::new(conf.clone(), es_process_queue_sender);
     let app_state = watcher.state_handle();
+    let state_file_path = conf
+        .state_file_path
+        .clone()
+        .unwrap_or("/tmp/logfowd2_state.json".to_string());
+    let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
+        .await?
+        .with_app_state(app_state.clone());
 
-    // Create metrics server
+    drop(watcher_channel);
+    drop(es_queue_channel);
+
     let metrics_config = conf.metrics.clone().unwrap_or_default();
     let metrics_server = MetricsServer::new(metrics_config);
-
-    let result = if metrics_enabled {
-        // Start all components including metrics server
-        tokio::try_join!(
-            async move {
-                watcher
-                    .run(watcher_shutdown_notify)
-                    .await
-                    .map_err(AppError::from)
-            },
-            async move {
-                let mut sender = sender;
-                sender.run(sender_shutdown_notify).await
-            },
-            async move {
-                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
-                    .await?
-                    .with_app_state(app_state);
-                worker_pool.run(es_shutdown_notify).await
-            },
-            async move {
-                metrics_server
-                    .run(metrics_shutdown_notify)
-                    .await
-                    .map_err(|e| AppError::ComponentStartup {
-                        component: format!("Metrics server: {}", e),
-                    })
-            },
-        )
+    let watcher_stop = watcher_shutdown.clone();
+    let mut watcher_task =
+        tokio::spawn(async move { watcher.run(watcher_stop).await.map_err(AppError::from) });
+    let sender_stop = sender_shutdown.clone();
+    let mut sender_task = tokio::spawn(async move {
+        let mut sender = sender;
+        sender.run(sender_stop).await
+    });
+    let pool_stop = pool_shutdown.clone();
+    let mut pool_task = tokio::spawn(async move { worker_pool.run(pool_stop).await });
+    let mut metrics_task = if metrics_enabled {
+        let metrics_stop = metrics_shutdown.clone();
+        Some(tokio::spawn(async move {
+            metrics_server
+                .run(metrics_stop)
+                .await
+                .map_err(|error| AppError::ComponentStartup {
+                    component: format!("Metrics server: {}", error),
+                })
+        }))
     } else {
-        // Start components without metrics server
-        info!("Metrics server disabled - starting core components only");
-        tokio::try_join!(
-            async move {
-                watcher
-                    .run(watcher_shutdown_notify)
-                    .await
-                    .map_err(AppError::from)
-            },
-            async move {
-                let mut sender = sender;
-                sender.run(sender_shutdown_notify).await
-            },
-            async move {
-                let mut worker_pool = EsWorkerPool::new(conf.clone(), es_queue_receiver)
-                    .await?
-                    .with_app_state(app_state);
-                worker_pool.run(es_shutdown_notify).await
-            },
-            // Dummy future to maintain same tuple structure
-            async move {
-                tokio::select! {
-                    _ = metrics_shutdown_notify.notified() => {
-                        info!("Dummy metrics task received shutdown signal");
-                    }
-                }
-                Ok::<(), AppError>(())
-            },
-        )
+        None
     };
 
-    match result {
-        Ok(_) => {
-            info!("shutdown completed");
-            Ok(())
-        }
-        Err(e) => {
-            error!("component failure: {}", e);
-            Err(e)
-        }
+    let mut watcher_result = None;
+    let mut sender_result = None;
+    let mut pool_result = None;
+    let mut metrics_result = None;
+    tokio::select! {
+        _ = shutdown_signal.notified() => info!("shutdown requested"),
+        result = &mut watcher_task => watcher_result = Some(result),
+        result = &mut sender_task => sender_result = Some(result),
+        result = &mut pool_task => pool_result = Some(result),
+        result = async {
+            match metrics_task.as_mut() {
+                Some(task) => task.await,
+                None => std::future::pending().await,
+            }
+        } => metrics_result = Some(result),
+    }
+
+    watcher_shutdown.notify_one();
+    let mut first_error = None;
+    record_task_result(
+        &mut first_error,
+        "watcher",
+        match watcher_result {
+            Some(result) => result,
+            None => watcher_task.await,
+        },
+    );
+    record_task_result(
+        &mut first_error,
+        "sender",
+        match sender_result {
+            Some(result) => result,
+            None => sender_task.await,
+        },
+    );
+    record_task_result(
+        &mut first_error,
+        "Elasticsearch pool",
+        match pool_result {
+            Some(result) => result,
+            None => pool_task.await,
+        },
+    );
+
+    metrics_shutdown.notify_one();
+    if let Some(task) = metrics_task {
+        record_task_result(
+            &mut first_error,
+            "metrics server",
+            match metrics_result {
+                Some(result) => result,
+                None => task.await,
+            },
+        );
+    }
+
+    let snapshot = app_state.read().await.clone_for_save();
+    if let Err(error) = snapshot.save_to_file(&state_file_path) {
+        record_task_result(
+            &mut first_error,
+            "final state save",
+            Ok(Err(AppError::ComponentStartup {
+                component: format!("state save: {}", error),
+            })),
+        );
+    }
+
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        info!("shutdown completed");
+        Ok(())
     }
 }

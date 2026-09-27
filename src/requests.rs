@@ -25,6 +25,9 @@ impl Index {
             hasher.update(source.path.as_bytes());
             hasher.update(source.inode.to_be_bytes());
             hasher.update(source.end.to_be_bytes());
+            if source.generation != 0 {
+                hasher.update(source.generation.to_be_bytes());
+            }
             hasher.update(event.message.as_bytes());
         } else {
             hasher.update(serde_json::to_vec(event).expect("Event serialization cannot fail"));
@@ -135,6 +138,7 @@ mod tests {
             path: "/var/log/pods/ns_pod_id/container/0.log".to_string(),
             inode: 42,
             end: 128,
+            generation: 1,
         };
         let first = Event::from_file("line".to_string(), Meta::default(), source.clone());
         let replay = Event::from_file("line".to_string(), Meta::default(), source);
@@ -144,6 +148,13 @@ mod tests {
             Index::for_event(&replay).index.id
         );
         assert_ne!(Index::for_event(&first).index.id, Index::new().index.id);
+
+        let mut next_generation = first.clone();
+        next_generation.source.as_mut().unwrap().generation += 1;
+        assert_ne!(
+            Index::for_event(&first).index.id,
+            Index::for_event(&next_generation).index.id
+        );
     }
 
     #[test]
