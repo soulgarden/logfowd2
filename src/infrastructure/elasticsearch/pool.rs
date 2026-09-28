@@ -21,7 +21,7 @@ use crate::infrastructure::elasticsearch::circuit_breaker::{
 use crate::infrastructure::elasticsearch::dead_letter_queue::{
     DeadLetterQueue, DeadLetterQueueConfig,
 };
-use crate::requests::{FieldsBody, Index};
+use crate::requests::{FieldsBody, FieldsBodyRef, Index};
 use crate::retry::{RetryConfig, RetryManager};
 use crate::transport::channels::BoundedReceiver;
 
@@ -729,9 +729,7 @@ impl EsWorker {
             self.id, circuit_state
         );
 
-        // Clone events for potential dead letter queue usage
-        let events_backup = events.clone();
-        let body = self.make_body(events)?;
+        let body = self.make_body(&events)?;
         let url = self.build_es_url();
         let http_client = self.http_client.clone();
         let worker_id = self.id;
@@ -793,7 +791,7 @@ impl EsWorker {
                     Ok(failures) => failures,
                     Err(e) => {
                         self.network_stats.record_failure();
-                        for event in events_backup {
+                        for event in events {
                             self.dead_letter_queue
                                 .add_failed_event(event, e.to_string())
                                 .await;
@@ -805,7 +803,7 @@ impl EsWorker {
                 let failure_count = failures.len();
                 let mut failure_reasons: HashMap<usize, String> = failures.into_iter().collect();
                 let mut succeeded = Vec::with_capacity(event_count - failure_count);
-                for (index, event) in events_backup.into_iter().enumerate() {
+                for (index, event) in events.into_iter().enumerate() {
                     if let Some(reason) = failure_reasons.remove(&index) {
                         self.dead_letter_queue.add_failed_event(event, reason).await;
                     } else {
@@ -850,7 +848,7 @@ impl EsWorker {
                 );
 
                 // Add failed events to dead letter queue
-                for event in events_backup {
+                for event in events {
                     self.dead_letter_queue
                         .add_failed_event(event, failure_reason.clone())
                         .await;
@@ -873,7 +871,7 @@ impl EsWorker {
                 );
 
                 // Add failed events to dead letter queue
-                for event in events_backup {
+                for event in events {
                     self.dead_letter_queue
                         .add_failed_event(event, failure_reason.clone())
                         .await;
@@ -884,25 +882,18 @@ impl EsWorker {
         }
     }
 
-    fn make_body(&self, events: Vec<Event>) -> std::result::Result<Vec<u8>, EsError> {
+    fn make_body(&self, events: &[Event]) -> std::result::Result<Vec<u8>, EsError> {
         let mut body: Vec<u8> = Vec::new();
 
         for event in events {
             // Add index action
-            let index = Index::for_event(&event);
+            let index = Index::for_event(event);
             serde_json::to_writer(&mut body, &index)
                 .map_err(|e| EsError::SerializationFailed(format!("Index serialization: {}", e)))?;
             body.put_slice(b"\n");
 
             // Add document
-            let fields_body = FieldsBody::new(
-                event.message,
-                event.timestamp,
-                event.meta.pod_name,
-                event.meta.namespace,
-                event.meta.container_name,
-                event.meta.pod_id,
-            );
+            let fields_body = FieldsBodyRef::for_event(event);
 
             serde_json::to_writer(&mut body, &fields_body).map_err(|e| {
                 EsError::SerializationFailed(format!("Document serialization: {}", e))
@@ -1652,5 +1643,52 @@ mod tests {
             validation_result.is_err(),
             "Config with 0 workers should fail validation"
         );
+    }
+
+    #[test]
+    #[ignore = "run with cargo test --release bench_bulk_body -- --ignored --nocapture"]
+    fn bench_bulk_body() {
+        let dlq = Arc::new(DeadLetterQueue::new(DeadLetterQueueConfig {
+            persistence_file: None,
+            ..DeadLetterQueueConfig::default()
+        }));
+        let worker = EsWorker::new_with_client(0, create_test_config(), dlq, Arc::new(NoopClient));
+
+        for message_size in [128, 4_096] {
+            let meta = Meta {
+                pod_name: "pod".into(),
+                namespace: "namespace".into(),
+                container_name: "container".into(),
+                pod_id: "pod-id".into(),
+            };
+            let events: Vec<_> = (0..500)
+                .map(|index| {
+                    Event::from_file(
+                        "x".repeat(message_size),
+                        meta.clone(),
+                        SourcePosition {
+                            path: "/var/log/pods/namespace_pod-id/container/0.log".into(),
+                            inode: 42,
+                            end: (index + 1) * message_size as u64,
+                            generation: 1,
+                        },
+                    )
+                })
+                .collect();
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                let input = events.clone();
+                let start = std::time::Instant::now();
+                let body = worker.make_body(&input).unwrap();
+                std::hint::black_box((&input, &body));
+                samples.push(start.elapsed());
+            }
+            samples.sort_unstable();
+            println!(
+                "bulk_body 500x{message_size}B: median {:.2} ms, {:.0} events/s",
+                samples[10].as_secs_f64() * 1_000.0,
+                500.0 / samples[10].as_secs_f64()
+            );
+        }
     }
 }

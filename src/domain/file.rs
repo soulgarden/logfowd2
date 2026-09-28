@@ -172,6 +172,7 @@ impl FileTracker {
         if let Some(ref mut file) = self.file {
             let mut reader = BufReader::with_capacity(self.buffer_size, &mut *file);
             let mut line = String::new();
+            let mut buffer = Vec::with_capacity(self.max_line_size.min(8192));
             let mut limit_reached = false;
 
             loop {
@@ -183,11 +184,14 @@ impl FileTracker {
                 }
 
                 line.clear();
-                let max_line_size = self.max_line_size; // Copy value to avoid borrow issues
-                let path = self.path.clone(); // Copy path for logging
-                let bytes_read =
-                    Self::read_line_limited_static(max_line_size, &path, &mut reader, &mut line)
-                        .await?;
+                let bytes_read = Self::read_line_limited_static(
+                    self.max_line_size,
+                    &self.path,
+                    &mut reader,
+                    &mut buffer,
+                    &mut line,
+                )
+                .await?;
 
                 if bytes_read == 0 {
                     // EOF reached
@@ -207,7 +211,7 @@ impl FileTracker {
                 if !line.is_empty() {
                     app_state.register_pending(&self.path, self.inode, self.position);
                     events.push(Event::from_file(
-                        line.clone(),
+                        std::mem::take(&mut line),
                         self.meta.clone(),
                         SourcePosition {
                             path: self.path.clone(),
@@ -581,9 +585,10 @@ impl FileTracker {
         max_line_size: usize,
         path: &str,
         reader: &mut R,
+        buffer: &mut Vec<u8>,
         line: &mut String,
     ) -> Result<usize, std::io::Error> {
-        let mut buffer = Vec::with_capacity(max_line_size.min(8192));
+        buffer.clear();
         let mut bytes_read = 0;
         let mut saw_newline = false;
 
@@ -627,8 +632,7 @@ impl FileTracker {
             }
 
             if safe_end > 0 {
-                let line_content = Self::sanitize_corrupted_content(&buffer[..safe_end], path);
-                line.push_str(&line_content);
+                Self::append_sanitized_content(&buffer[..safe_end], path, line);
             }
 
             warn!(
@@ -641,12 +645,28 @@ impl FileTracker {
                 line.push('\n');
             }
         } else {
-            // Line is within size limits, process normally
-            let line_content = Self::sanitize_corrupted_content(&buffer, path);
-            line.push_str(&line_content);
+            Self::append_sanitized_content(buffer, path, line);
         }
 
         Ok(bytes_read)
+    }
+
+    fn append_sanitized_content(buffer: &[u8], path: &str, line: &mut String) {
+        let has_null_bytes = buffer.contains(&0);
+        let has_excessive_control_chars = buffer
+            .iter()
+            .filter(|&&b| b < 32 && b != b'\t' && b != b'\r' && b != b'\n')
+            .count()
+            > buffer.len() / 10;
+
+        if !has_null_bytes
+            && !has_excessive_control_chars
+            && let Ok(valid) = std::str::from_utf8(buffer)
+        {
+            line.push_str(valid);
+        } else {
+            line.push_str(&Self::sanitize_corrupted_content(buffer, path));
+        }
     }
 
     /// Sanitize potentially corrupted content from log files
@@ -2098,6 +2118,37 @@ mod tests {
         #[cfg(not(unix))]
         {
             println!("Skipping symlink permission test on non-Unix system");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "run with cargo test --release bench_file_read -- --ignored --nocapture"]
+    async fn bench_file_read() {
+        for (line_count, line_size) in [(20_000, 128), (5_000, 4_096)] {
+            let line = format!("{}\n", "x".repeat(line_size - 1));
+            let file = create_test_file_with_content(&line.repeat(line_count)).await;
+            let path = file.path().to_string_lossy().into_owned();
+            let mut samples = Vec::new();
+
+            for _ in 0..5 {
+                let mut state = AppState::new();
+                let mut tracker = FileTracker::new(path.clone(), create_test_meta(), &mut state)
+                    .await
+                    .unwrap();
+                let start = Instant::now();
+                let events = tracker.read_new_lines(&mut state).await.unwrap();
+                std::hint::black_box(&events);
+                let elapsed = start.elapsed();
+                assert_eq!(events.len(), line_count);
+                samples.push(elapsed);
+            }
+
+            samples.sort_unstable();
+            println!(
+                "file_read {line_count}x{line_size}B: median {:.2} ms, {:.0} lines/s",
+                samples[2].as_secs_f64() * 1_000.0,
+                line_count as f64 / samples[2].as_secs_f64()
+            );
         }
     }
 }
