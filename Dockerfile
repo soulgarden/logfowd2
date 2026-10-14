@@ -1,4 +1,4 @@
-FROM rust:1.98.1-alpine3.24 AS builder
+FROM rust:1.99.0-alpine3.24 AS builder
 
 RUN apk add --no-cache pkgconfig make
 
