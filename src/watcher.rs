@@ -321,11 +321,7 @@ impl Watcher {
                                                 .inc();
                                         }
 
-                                        let events = self.handle_create_event(path).await;
-                                        if !events.is_empty() {
-                                            self.safe_send_events(events).await;
-                                        }
-                                        self.drain_tracked_file(path_str).await;
+                                        self.handle_file_created(path).await;
                                     }
                                 }
                                 EventKind::Modify(Data(_data_change)) => {
@@ -335,7 +331,7 @@ impl Watcher {
                                             None => continue,
                                         };
 
-                                        self.drain_tracked_file(&path_str).await;
+                                        self.handle_file_rotation(&path_str).await;
                                     }
                                 }
                                 EventKind::Modify(Name(rename_mode)) => {
@@ -753,6 +749,20 @@ impl Watcher {
                 break;
             }
             self.safe_send_events(events).await;
+        }
+    }
+
+    /// Process a create notification, including replacement at an already tracked path.
+    async fn handle_file_created(&mut self, path: &Path) {
+        if let Some(path_str) = path.to_str() {
+            self.handle_file_rotation(path_str).await;
+        }
+        let events = self.handle_create_event(path).await;
+        if !events.is_empty() {
+            self.safe_send_events(events).await;
+        }
+        if let Some(path_str) = path.to_str() {
+            self.drain_tracked_file(path_str).await;
         }
     }
 
@@ -2195,5 +2205,184 @@ mod tests {
         watcher.drain_and_remove_file("/nonexistent/path").await;
         assert!(watcher.file_trackers.is_empty());
         assert!(watcher.app_state.read().await.files.is_empty());
+    }
+
+    async fn assert_rotation_delivery(gap: bool, create_notification: bool) {
+        use std::io::Write;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("pods");
+        let log_dir = root.join("ns_pod_pod-id/container");
+        fs::create_dir_all(&log_dir).unwrap();
+        let log_file = log_dir.join("0.log");
+        fs::write(&log_file, "history\n").unwrap();
+        let channel = create_bounded_channel(4096, None, None, None, None);
+        let receiver = channel.receiver();
+        let mut conf = create_test_conf();
+        conf.log_path = root.to_string_lossy().to_string();
+        conf.state_file_path = Some(dir.path().join("state.json").to_string_lossy().to_string());
+        conf.read_existing_on_startup = Some(false);
+        conf.read_chunk_size = Some(64);
+        let mut watcher = Watcher::new(conf, channel.sender());
+        watcher.regexp = Regex::new(&K8S_PODS_REGEXP.replacen(
+            "/var/log/pods",
+            &regex::escape(root.to_str().unwrap()),
+            1,
+        ))
+        .unwrap();
+        let shutdown = Arc::new(Notify::new());
+        let bridge = watcher
+            .event_bridge
+            .start_bridge_task(watcher.process_queue_sender.clone(), shutdown.clone());
+        watcher.handle_file_created(&log_file).await;
+        watcher.initial_sync_completed = true;
+        let path = log_file.to_string_lossy().to_string();
+        let mut generation = watcher
+            .app_state
+            .read()
+            .await
+            .file_generation(&path)
+            .unwrap();
+        let mut seen_ids = HashSet::new();
+        for round in 0..8 {
+            let old_inode = watcher.file_trackers[&path].get_inode();
+            let mut old = fs::OpenOptions::new().append(true).open(&log_file).unwrap();
+            let rotated = log_dir.join(format!("0.log.20261018-{round:06}"));
+            fs::rename(&log_file, &rotated).unwrap();
+            // Drain every old-file write available when From is processed.
+            // Also exceed the old 250-event rotation-tail limit.
+            let mut expected = (0..300)
+                .map(|n| format!("tail {round} {n}"))
+                .collect::<Vec<_>>();
+            for line in &expected {
+                writeln!(old, "{line}").unwrap();
+            }
+            old.flush().unwrap();
+            if gap {
+                // Linux RenameMode::From before the replacement exists.
+                watcher.handle_file_rotation(&path).await;
+                assert!(!watcher.file_trackers[&path].is_open());
+            }
+            let created = format!("created {round}");
+            fs::write(
+                &log_file,
+                if round % 2 == 0 {
+                    format!("{created}\n")
+                } else {
+                    String::new()
+                },
+            )
+            .unwrap();
+            // RenameMode::To is ignored by the K8s regexp. RenameMode::Both
+            // arrives too and is ignored for the timestamp-suffixed name.
+            watcher
+                .handle_file_rename(path.clone(), rotated.to_string_lossy().to_string())
+                .await;
+            if create_notification {
+                // This is the same handler called by EventKind::Create.
+                watcher.handle_file_created(&log_file).await;
+            } else {
+                // Modify(Data) must also recover when Create was missed.
+                watcher.handle_file_rotation(&path).await;
+            }
+            if round % 2 != 0 {
+                // Kubelet can create an empty replacement, then write later.
+                writeln!(
+                    fs::OpenOptions::new().append(true).open(&log_file).unwrap(),
+                    "{created}"
+                )
+                .unwrap();
+                watcher.handle_file_rotation(&path).await;
+            }
+            expected.push(created);
+            for message in expected {
+                let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("rotation {round}, gap={gap}: missing {message}"))
+                    .unwrap();
+                assert_eq!(event.message, message);
+                let id = serde_json::to_string(&crate::requests::Index::for_event(&event)).unwrap();
+                assert!(seen_ids.insert(id), "duplicate source event");
+                let source = event.source.as_ref().unwrap();
+                if message == format!("created {round}") {
+                    assert_ne!(source.generation, generation);
+                    assert_ne!(source.inode, old_inode);
+                    generation = source.generation;
+                    assert_eq!(source.end, message.len() as u64 + 1);
+                }
+                watcher
+                    .app_state
+                    .write()
+                    .await
+                    .mark_source_delivered(source);
+            }
+            let appended = format!("appended {round}");
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&log_file).unwrap(),
+                "{appended}"
+            )
+            .unwrap();
+            // The Modify(Data) branch refreshes the tracked path before reading.
+            watcher.handle_file_rotation(&path).await;
+            let event = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("subsequent write must be delivered")
+                .unwrap();
+            assert_eq!(event.message, appended);
+            assert_eq!(event.source.as_ref().unwrap().generation, generation);
+            watcher
+                .app_state
+                .write()
+                .await
+                .mark_source_delivered(event.source.as_ref().unwrap());
+            let snapshot = watcher.app_state.read().await.clone_for_save();
+            assert_eq!(
+                snapshot.files[&path].position,
+                fs::metadata(&log_file).unwrap().len()
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), receiver.recv())
+                .await
+                .is_err(),
+            "unexpected duplicate event"
+        );
+        shutdown.notify_waiters();
+        bridge.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kubelet_rotation_delivery_with_missing_path_gap() {
+        assert_rotation_delivery(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_kubelet_rotation_delivery_with_combined_rename() {
+        assert_rotation_delivery(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_kubelet_rotation_delivery_after_missed_create() {
+        assert_rotation_delivery(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_rotation_without_replacement_closes_old_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let log_file = dir.path().join("0.log");
+        let rotated = dir.path().join("0.log.20261018-142126");
+        fs::write(&log_file, "history\n").unwrap();
+        let channel = create_bounded_channel(8, None, None, None, None);
+        let mut conf = create_test_conf();
+        conf.state_file_path = Some(dir.path().join("state.json").to_string_lossy().to_string());
+        conf.read_existing_on_startup = Some(false);
+        let mut watcher = Watcher::new(conf, channel.sender());
+        watcher.handle_file_created(&log_file).await;
+        let path = log_file.to_string_lossy().to_string();
+        assert!(watcher.file_trackers[&path].is_open());
+
+        fs::rename(&log_file, &rotated).unwrap();
+        watcher.handle_file_rotation(&path).await;
+        fs::remove_file(&rotated).unwrap();
+        assert!(!watcher.file_trackers[&path].is_open());
     }
 }
